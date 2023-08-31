@@ -9,7 +9,7 @@ import torch.nn.functional as f
 from torch.distributions import Categorical
 from torch.utils.data.sampler import *
 import numpy as np
-import copy
+from argparse import Namespace
 from torch.nn.utils import spectral_norm
 from torch.utils.data import Dataset, DataLoader
 from mappo.obstacle_differ_3hop.module.replay_buffer import MiniBuffer
@@ -38,11 +38,11 @@ class CustomMaxPool(nn.Module):
 
     def forward(self, x):
         # Calculate max values along the specified dimension
-        max_values, max_indices = torch.max(x, dim=-1, keepdim=True)
+        _, max_indices = torch.max(x, dim=-1, keepdim=True)
         
         # Mask to retain only the maximum values and zero out others
         mask = torch.zeros_like(x)
-        mask.scatter_(1, max_indices, max_values)
+        mask.scatter_(1, max_indices, 1)
         
         # Apply the mask and return
         pooled_features = x * mask
@@ -60,111 +60,189 @@ class CustomDataset(Dataset):
     def __getitem__(self, index):
         x = self.data[index]
         y = self.labels[index]
-        return x, y
+        z = self.adj[index]
+        return x, y, z
     
 
 class DHGN(nn.Module):
-    def __init__(self, input_size, middle_size, output_size, is_sn: bool, algo_config):
+    def __init__(self, input_size, embedding_size, is_sn: bool, algo_config: Namespace, device):
         super().__init__()
         self.ReLU = nn.ReLU()
         self.MSG_layers = nn.ModuleList()
         self.AGG_layers = nn.ModuleDict()
+        self.FCRA_layers = nn.ModuleList()
         self.alpha = nn.ModuleDict()
-        
+        self.v_agg = algo_config.vertex_level_aggregator
+        self.s_agg = algo_config.semantic_level_aggregator
+        self.fcra_agg = algo_config.fcra_aggregator
+        self.algo_config = algo_config
+        self.device = device
+        # feature: (*, num_agent, num_agent, input_size -> embedding_size)
         for r in range(algo_config.num_relation):
-            layer = preproc_layer(input_size, middle_size) if is_sn else nn.Linear(input_size, middle_size)
+            layer = preproc_layer(input_size, embedding_size) if is_sn else nn.Linear(input_size, embedding_size)
             self.MSG_layers.append(layer)
 
-        if algo_config.vertex_level_aggregator == 'mean':
+        for k in range(algo_config.depth):
+            layer = preproc_layer(input_size, embedding_size) if is_sn else nn.Linear(input_size, embedding_size)
+            self.FCRA_layers.append(layer)
+
+        # feature: (*, num_agent, num_agent -> 1, embedding_size -> embedding_size)
+        # adjacent matrix: (*, num_agent, 1, num_agent)
+        # alpha: (*, )
+        if self.v_agg == 'mean':
             for r in range(algo_config.num_relation):
-                layer = preproc_layer(input_size, middle_size) if is_sn else nn.Linear(input_size, middle_size)
+                layer = preproc_layer(embedding_size, embedding_size) if is_sn else nn.Linear(embedding_size, embedding_size)
                 self.AGG_layers[f'AGG_vertex_{r}'] = layer
             self.vertex_aggregate = self.mean_operator
-        elif algo_config.vertex_level_aggregator == 'pool':
+        elif self.v_agg == 'pool':
             for r in range(algo_config.num_relation):
-                layer = preproc_layer(input_size, middle_size) if is_sn else nn.Linear(input_size, middle_size)
+                layer = preproc_layer(embedding_size, embedding_size) if is_sn else nn.Linear(embedding_size, embedding_size)
                 self.AGG_layers[f'AGG_vertex_{r}'] = layer
             self.max_pool_layer = CustomMaxPool()
             self.vertex_aggregate = self.pool_operator
-        elif algo_config.vertex_level_aggregator == 'att':
+        elif self.v_agg == 'att':
             for r in range(algo_config.num_relation):
-                layer = preproc_layer(input_size, middle_size) if is_sn else nn.Linear(input_size, middle_size)
+                layer = preproc_layer(embedding_size, embedding_size) if is_sn else nn.Linear(embedding_size, embedding_size)
                 self.AGG_layers[f'AGG_vertex_{r}'] = layer
-                alpha = Parameter(torch.zeros(size=(1, 2, 3)), required_grad=True)
+                alpha = Parameter(torch.zeros(size=(embedding_size, 1)), required_grad=True)
                 self.alpha[f'AGG_vertex_{r}'] = alpha
             self.LeakyReLU = nn.LeakyReLU()
             self.vertex_aggregate = self.att_operator
             
-        if algo_config.semantic_level_aggregator == 'mean':
-            layer = preproc_layer(input_size, middle_size) if is_sn else nn.Linear(input_size, middle_size)
+        if self.s_agg == 'mean':
+            layer = preproc_layer(embedding_size, embedding_size) if is_sn else nn.Linear(embedding_size, embedding_size)
             self.AGG_layers['AGG_semantic'] = layer
             self.semantic_aggregate = self.mean_operator
-        elif algo_config.semantic_level_aggregator == 'pool':
-            layer = preproc_layer(input_size, middle_size) if is_sn else nn.Linear(input_size, middle_size)
+        elif self.s_agg == 'pool':
+            layer = preproc_layer(embedding_size, embedding_size) if is_sn else nn.Linear(embedding_size, embedding_size)
             self.AGG_layers['AGG_semantic'] = layer
             self.semantic_aggregate = self.pool_operator
-        elif algo_config.sematic_level_aggregator == 'att':
-            layer = preproc_layer(input_size, middle_size) if is_sn else nn.Linear(input_size, middle_size)
+        elif self.s_agg == 'att':
+            layer = preproc_layer(embedding_size, embedding_size) if is_sn else nn.Linear(embedding_size, embedding_size)
             self.AGG_layers['AGG_semantic'] = layer
-            alpha = Parameter(torch.zeros(size=(1, 2, 3)), required_grad=True)
+            alpha = Parameter(torch.zeros(size=(embedding_size, 1)), required_grad=True)
             self.alpha['AGG_semantic'] = alpha
             self.semantic_aggregate = self.att_operator
                 
-        if algo_config.fcra_aggregator == 'mean':
+        if self.fcra_agg == 'mean':
             for k in range(algo_config.depth):
-                layer = preproc_layer(input_size, middle_size) if is_sn else nn.Linear(input_size, middle_size)
+                layer = preproc_layer(2 * embedding_size, embedding_size) if is_sn else nn.Linear(2 * embedding_size, embedding_size)
                 self.AGG_layers[f'AGG_fcra_{k}'] = layer
-            self.vertex_aggregate = self.mean_operator
-        elif algo_config.fcra_aggregator == 'pool':
+            self.fcra_aggregate = self.mean_operator
+        elif self.fcra_agg == 'pool':
             for k in range(algo_config.depth):
-                layer = preproc_layer(input_size, middle_size) if is_sn else nn.Linear(input_size, middle_size)
+                layer = preproc_layer(2 * embedding_size, embedding_size) if is_sn else nn.Linear(2 * embedding_size, embedding_size)
                 self.AGG_layers[f'AGG_fcra_{k}'] = layer
             self.max_pool_layer = CustomMaxPool()
-            self.vertex_aggregate = self.pool_operator
-        elif algo_config.fcra_aggregator == 'att':
+            self.fcra_aggregate = self.pool_operator
+        elif self.fcra_agg == 'att':
             for k in range(algo_config.depth):
-                layer = preproc_layer(input_size, middle_size) if is_sn else nn.Linear(input_size, middle_size)
+                layer = preproc_layer(2 * embedding_size, embedding_size) if is_sn else nn.Linear(2 * embedding_size, embedding_size)
                 self.AGG_layers[f'AGG_fcra_{k}'] = layer
-                alpha = Parameter(torch.zeros(size=(1, 2, 3)), required_grad=True)
+                alpha = Parameter(torch.zeros(size=(embedding_size, 1)), required_grad=True)
                 self.alpha[f'AGG_fcra_{k}'] = alpha
             self.LeakyReLU = nn.LeakyReLU()
-            self.vertex_aggregate = self.att_operator
+            self.fcra_aggregate = self.att_operator
 
-    def fcra(self, attributes, historical_embeddings, depth):
-        # h = 
-        # for i in range(depth):
-        pass
+    def fcra(self, h0: torch.Tensor, data_loader: Dataset) -> torch.Tensor:
+        """
+
+        Args:
+            h0 (torch.Tensor): current embeddings (*, num_agent, feature_dim)
+            data_loader (Dataset): get historical embeddings
+            hk (torch.Tensor): historical embeddings (*, num_agent, feature_dim)
+            adjacent_mat (torch.Tensor): (*, num_agent, num_agent)
+
+        Returns:
+            observation: (*, num_agent, 1, feature_dim)
+        """
+        h = h0
+        for a, k, adjacent_mat in data_loader:
+            if self.fcra_agg == 'att':
+                embeddings = self.fcra_aggregate(layer=self.AGG_layers[f'AGG_fcra_{k}'], alpha=self.alpha[f'AGG_fcra_{k}'], message=a, adjacent_mat=adjacent_mat)
+            elif self.fcra_agg == 'mean':
+                embeddings = self.fcra_aggregate(layer=self.AGG_layers[f'AGG_fcra_{k}'], message=a, adjacent_mat=adjacent_mat)
+            elif self.fcra_agg == 'pool':
+                num_agent = a.size()[-2]
+                a = a.unsqueeze(-2)
+                expand_size = [-1] * len(a.size())
+                expand_size[-2] = num_agent
+                a.unsqueeze(-2).expand(*expand_size).transpose(-2, -3)  # (*, num_agent, feature_dim) -> (*, num_agent, num_agent, feature_dim)
+                embeddings = self.fcra_aggregate(layer=self.AGG_layers[f'AGG_fcra_{k}'], message=a, adjacent_mat=adjacent_mat)
+                embeddings = embeddings.squeeze(-2)
+            FCRA_layer = self.FCRA_layers[k]
+            h = self.ReLU(FCRA_layer(torch.concatenate([embeddings, h], dim=-1)))
+        return h
+
+    def coordinate(self, t1: torch.Tensor, t2: torch.Tensor) -> torch.Tensor:
+        t1 = t1.unsqueeze(-2)
+        t2 = t2.unsqueeze(-3)
+        relative_coordinates = t1 - t2
+        return relative_coordinates
+
+    def encoder(self, data_loader: Dataset) -> torch.Tensor:
+        """
+        Args:
+            data_loader (Dataset): _description_
+            attributes: the attributes cooresponding to the relation types
+                shape = (*, num_agent, num_agent/obstacle, feature_dim)
+            relations: the relation types belong to 0, 1
+            adjacent_mat:
+                shape = (*, num_agent, num_agent/obstacle)
             
-    def encoder(self, data_loader):
+        Returns:
+            torch.Tensor: the semantic-level embeddings, also representing the current historical embeddings h0
+                shape = (*, num_agnet, feature_dim)
+        """
         embeddings_list = list()
-        for attributes, relation in data_loader:
-            message = self.message(layer=getattr(self, f'MSG_{relation}'), attributes=attributes)
-            vertex_level_embeddings = self.aggregate(layer=getattr(self, f'AGG_{relation}'), )
-            embeddings_list.append(vertex_level_embeddings)
-            
-    
-    def forward(self, obs: torch.Tensor, last_comm_embedding: torch.Tensor = None, adj: torch.Tensor = None) -> torch.Tensor:
-        '''
-        :param obs: shape = [*, agent_num, agent_num, orig_feature_dim]
-        :param adj: shape = [*, agent_num, 1, agent_num]
-        :return residual_extract_feature:  shape = [*, agent_num, 3 * orig_feature_dim]
-        '''
-        # last_comm_embedding = last_comm_embedding.repeat([])
-        adj = f.normalize(adj, p=1, dim=-1)
-        adj = adj.unsqueeze(dim=-2)
-        h0 = self.one_hop(obs)
+        for a1, a2, r, adjacent_mat in data_loader:
+            # message
+            a = self.coordinate(a1, a2)
+            message = self.message(layer=self.MSG_layers[r], attributes=a)
+            # aggregate
+            if self.v_agg == 'att':
+                adjacent_mat = adjacent_mat.unsqueeze(-2)
+                embeddings = self.vertex_aggregate(layer=self.AGG_layers['AGG_vertex_{r}'], alpha=self.alpha['AGG_vertex_{r}'], message=message, adjacent_mat=adjacent_mat)
+            elif self.v_agg == 'mean':
+                adjacent_mat = adjacent_mat.unsqueeze(-2)
+                embeddings = self.vertex_aggregate(layer=self.AGG_layers['AGG_vertex_{r}'], message=message, adjacent_mat=adjacent_mat)
+            elif self.v_agg == 'pool':
+                embeddings = self.vertex_aggregate(layer=self.AGG_layers['AGG_vertex_{r}'], message=message, adjacent_mat=adjacent_mat)
+            embeddings_list.append(embeddings)
+        vertex_level_embeddings = torch.concatenate(embeddings_list, dim=-2)
+        """
+            vertex_level_embeddings: (*, num_agent, num_relation, feature_dim)
+            adjacent_mat: (*, num_agent, num_relation)
+        Returns:
+            semantic_level_embeddings: (*, num_agent, 1, feature_dim)
+        """
+        adjacent_mat = torch.ones(size=vertex_level_embeddings.size()[:-1], device=self.device, requires_grad=False)
+        if self.s_agg == 'att':
+            adjacent_mat = adjacent_mat.unsqueeze(-2)
+            semantic_level_embeddings = self.semantic_aggregate(layer=self.AGG_layers['AGG_semantic'], alpha=self.alpha['AGG_semantic'], message=vertex_level_embeddings, adjacent_mat=None)
+        elif self.s_agg == 'mean':
+            adjacent_mat = adjacent_mat.unsqueeze(-2)
+            semantic_level_embeddings = self.semantic_aggregate(layer=self.AGG_layers['AGG_semantic'], message=vertex_level_embeddings, adjacent_mat=adjacent_mat)
+        elif self.s_agg == 'pool':
+            semantic_level_embeddings = self.semantic_aggregate(layer=self.AGG_layers['AGG_semantic'], message=vertex_level_embeddings, adjacent_mat=adjacent_mat)
+        return semantic_level_embeddings
+
+    def forward(self, attributes: Dataset, historical_embeddings: Dataset) -> torch.Tensor:
+        """_summary_
+
+        Args:
+            attributes (Dataset): 
+                (*, num_agent, feature_dim), (*, num_agent/obstacle, feature_dim), r, (*, num_agent, num_agent/obstacle)
+            historical_embeddings (Dataset): _description_
+                (*, num_agent, feature_dim), r, (*, num_agent, num_agent)
                 
-        h0_agg = torch.matmul(adj, h0)
-        h0_agg = h0_agg.squeeze(dim=-2)
-        adj = adj.squeeze(dim=-2)
-        agent_num = adj.shape[-2]
-        if len(adj.shape) == 2:
-            comm_agg = torch.matmul(adj[:, :agent_num], last_comm_embedding)
-        else:
-            comm_agg = torch.matmul(adj[:, :, :, :agent_num], last_comm_embedding)
-        feature_agg = torch.concatenate([h0_agg, comm_agg], dim=-1)
-        feature = self.bottleneck(feature_agg)
-        return feature
+        Returns:
+            torch.Tensor: encoded_observation (*, num_agent, feature_dim)
+        """
+        h0 = self.encoder(data_loader=attributes).squeeze(-2)
+        observation = self.fcra(h0=h0, data_loader=historical_embeddings)
+        observation = observation.squeeze(-2)
+        return observation
 
     def message(self, layer: nn.Linear, attributes: torch.Tensor) -> torch.Tensor:
         """the message operator denoted by MSG() placeholder
@@ -180,34 +258,50 @@ class DHGN(nn.Module):
         return message
         
     def mean_operator(self, layer: nn.Linear, message: torch.Tensor, adjacent_mat: torch.Tensor) -> torch.Tensor:
-        """the mean aggregator denoted by AGG() placeholder
-
+        """
         Args:
             layer (nn.Linear): the relation-specific linear transform matrix
-            message (torch.Tensor): the message
-            adjacent_mat (torch.Tensor): the adjacent matrix
+            message (torch.Tensor): the message (*, num_agent, num_agent/obstacle, feature_dim)
+            adjacent_mat (torch.Tensor): the adjacent matrix (*, num_agent, 1, num_agent/obstacle)
 
         Returns:
-            torch.Tensor: vertex/semantic-level embeddings
+            torch.Tensor: vertex/semantic-level embeddings (*, num_agent, 1, feature_dim)
         """
         adjacent_mat = f.normalize(adjacent_mat, p=1, dim=-1)
-        adjacent_mat = adjacent_mat.unsqueeze(dim=-2)
         embeddings = self.ReLU(layer(torch.matmul(adjacent_mat, message)))
         return embeddings
-    
+
     def pool_operator(self, layer: nn.Linear, message: torch.Tensor, adjacent_mat: torch.Tensor) -> torch.Tensor:
-        """the max-pooling aggregator denoted by AGG() placeholder
-        """        
-        adjacent_mat = adjacent_mat.unsqueeze(dim=-1)
-        embeddings = self.max_pool_layer(self.ReLU(layer(adjacent_mat * message)))
+        """
+        Args:
+            layer (nn.Linear): the relation-specific linear transform matrix
+            message (torch.Tensor): the message (*, num_agent, num_agent/obstacle, feature_dim)
+            adjacent_mat (torch.Tensor): the adjacent matrix, as a mask (*, num_agent, num_agent/obstacle, 1)
+
+        Returns:
+            torch.Tensor: vertex/semantic-level embeddings (*, num_agent, 1, feature_dim)
+        """
+        adj_1 = adjacent_mat.unsqueeze(-1)
+        embeddings = self.max_pool_layer(self.ReLU(layer(adj_1 * message)))
+        adj_2 = adjacent_mat.unsqueeze(-2)
+        embeddings = torch.matmul(adj_2, embeddings)
         return embeddings
         
     def att_operator(self, layer: nn.Linear, alpha: torch.Tensor, message: torch.Tensor, adjacent_mat: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            layer (nn.Linear): the relation-specific linear transform matrix
+            alpha (torch.Tensor): the learned weights (*, feature_dim, 1)
+            message (torch.Tensor): the message (*, num_agent, num_agent/obstacle, feature_dim)
+            adjacent_mat (torch.Tensor): the adjacent matrix, as a mask (*, num_agent, num_agent/obstacle)
+            attention_score (torch.Tensor): 
+        Returns:
+            torch.Tensor: vertex/semantic-level embeddings (*, num_agent, 1, feature_dim)
+        """       
         mask = adjacent_mat != 1
-        mask = mask.repeat()  # TODO:
-        alpha = alpha.repeat()  # TODO:
-        
-        attention_score = torch.matmul(self.LeakyReLU(layer(message)), alpha)
+        repeat_time = message.size()[:-2]  # (*, )
+        alpha = alpha.expand(repeat_time + alpha.size())  
+        attention_score = torch.matmul(self.LeakyReLU(layer(message)), alpha)  # (*, num_agent/obstacle, 1)
         attention_score = torch.masked_fill(mask, value=float("-inf"))
         attention_score = f.softmax(attention_score, dim=-1)
         mask = torch.isnan(attention_score)
@@ -216,15 +310,7 @@ class DHGN(nn.Module):
         embeddings = self.ReLU(torch.matmul(attention_score, layer(message)))
         return embeddings
 
-
-class FCRA(DHGN):
-    def __init__(self, input_size, middle_size, output_size, is_sn: bool = False):
-        super().__init__(input_size, middle_size, output_size, is_sn)
         
-    def forward(self):
-        
-
-
 class SharedActor(nn.Module):
     def __init__(self, shared_net, rnn_input_dim, output_size, num_layers, hidden_size, is_sn=False):
         super().__init__()
@@ -430,24 +516,16 @@ class MAPPO:
         #     print("------use agent specific global state------")
         #     self.critic_input_dim += args.obs_dim
         
-        actor_gnn = GnnExtractor(
-            input_size=self.actor_input_dim,
-            middle_size=args.gnn_middle_dim, 
-            output_size=args.gnn_output_dim, 
-            n_hops=args.n_hops, 
-            is_sn=args.use_spectral_norm
+        encoder = DHGN(
+            input_size=self.input_size,
+            embedding_size=args.embedding_size,
+            is_sn=args.use_spectral_norm,
+            algo_config=args,
+            device=self.device
         )
         
-        critic_gnn = GnnExtractor(
-            input_size=self.critic_input_dim,
-            middle_size=args.gnn_middle_dim, 
-            output_size=args.gnn_output_dim, 
-            n_hops=args.n_hops, 
-            is_sn=args.use_spectral_norm
-        )
-
         self.actor = SharedActor(
-            shared_net=actor_gnn,
+            shared_net=encoder,
             rnn_input_dim=self.rnn_input_dim, 
             output_size=args.action_dim, 
             num_layers=args.num_layers, 
@@ -456,7 +534,7 @@ class MAPPO:
             )
         
         self.critic = SharedCritic(
-            shared_net=critic_gnn,
+            shared_net=encoder,
             rnn_input_dim=self.rnn_input_dim, 
             output_size=1, 
             num_layers=args.num_layers, 
@@ -464,11 +542,11 @@ class MAPPO:
             is_sn=args.use_spectral_norm
             )
 
-        pretrain_actor = torch.load('./model/actor.pth', map_location='cpu')
-        pretrain_critic = torch.load('./model/critic.pth', map_location='cpu')
+        # pretrain_actor = torch.load('./model/actor.pth', map_location='cpu')
+        # pretrain_critic = torch.load('./model/critic.pth', map_location='cpu')
 
-        self.actor.load_state_dict(pretrain_actor.state_dict())
-        self.critic.load_state_dict(pretrain_critic.state_dict())
+        # self.actor.load_state_dict(pretrain_actor.state_dict())
+        # self.critic.load_state_dict(pretrain_critic.state_dict())
         
         self.actor = self.actor.to(self.device)
         self.critic = self.critic.to(self.device)
@@ -476,7 +554,8 @@ class MAPPO:
         # self.actor.load_state_dict(torch.load(args.pretrain_model_cwd + '/pretrain_model.pth'))
         # self.critic.load_state_dict(torch.load('experiment/pretrain_model_0/actor_199999.pth'))
 
-        self.ac_parameters = list(self.critic.shared_net.parameters()) + list(self.actor.shared_net.parameters()) + list(self.actor.GRU.parameters()) + list(self.critic.GRU.parameters()) + list(self.critic.Mean.parameters()) + list(self.actor.Mean.parameters())
+        # self.ac_parameters = list(self.critic.shared_net.parameters()) + list(self.actor.shared_net.parameters()) + list(self.actor.GRU.parameters()) + list(self.critic.GRU.parameters()) + list(self.critic.Mean.parameters()) + list(self.actor.Mean.parameters())
+        self.ac_parameters = list(self.actor.shared_net.parameters()) + list(self.actor.GRU.parameters()) + list(self.critic.GRU.parameters()) + list(self.critic.Mean.parameters()) + list(self.actor.Mean.parameters())
         self.ac_optimizer = torch.optim.Adam(self.ac_parameters, lr=self.lr, eps=1e-5)
         
         self.minibuffer = None
