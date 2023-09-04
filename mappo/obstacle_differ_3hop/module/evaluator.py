@@ -6,6 +6,7 @@ import torch.nn
 import numpy as np
 from torch import Tensor
 from copy import deepcopy
+from torch.utils.data import Dataset, DataLoader
 
 
 @ray.remote(num_cpus=1, num_gpus=0.001)
@@ -54,9 +55,9 @@ class EvaluatorProc(object):
         print(f'| TrainingTime: {time.time() - self.start_time:>7.0f}')
         return [if_train, ref_list]
     
-    def evaluate_and_save(self, new_total_step: int, exp_r: float, exp_win_rate: float, exp_collision_rate: float, logging_tuple: tuple):
+    def evaluate_and_save(self, new_total_step: int, exp_r: float, logging_tuple: tuple):
         self.total_step = new_total_step
-        win_rate, collision_rate, rewards_step_ten = self.get_rewards_and_step()
+        rewards_step_ten = self.get_rewards_and_step()
         returns = rewards_step_ten[:, 0]  # episodic cumulative returns of an
         steps = rewards_step_ten[:, 1]  # episodic step number
         avg_r = returns.mean().item()
@@ -65,21 +66,16 @@ class EvaluatorProc(object):
         std_s = steps.std().item()
 
         train_time = int(time.time() - self.start_time)
-
         '''record the training information'''
-        self.recorder.append((self.total_step, avg_r, std_r, exp_r, win_rate, collision_rate, *logging_tuple))  # update recorder
-
+        self.recorder.append((self.total_step, avg_r, std_r, exp_r, *logging_tuple))  # update recorder
         '''print some information to Terminal'''
-        prev_win_rate = self.max_win_rate
-        prev_collision_rate = self.min_collision_rate
-        self.max_win_rate = max(self.max_win_rate, win_rate)
-        self.min_collision_rate = min(self.min_collision_rate, collision_rate)
+        prev_r = self.max_r
         self.max_r = max(self.max_r, avg_r)  # update max average cumulative rewards
         print(f"{self.agent_id:<3}{self.total_step:8.2e}{train_time:8.0f} |"
-              f"{avg_r:8.2f}{std_r:7.1f}{win_rate:8.2f}{collision_rate:8.2f}{avg_s:7.0f}{std_s:6.0f} |"
-              f"{exp_r:8.2f}{exp_win_rate:8.2f}{exp_collision_rate:8.2f}{''.join(f'{n:7.2f}' for n in logging_tuple)}")
+              f"{avg_r:8.2f}{std_r:7.1f}{avg_s:7.0f}{std_s:6.0f} |"
+              f"{exp_r:8.2f}{''.join(f'{n:7.2f}' for n in logging_tuple)}")
             
-        if_save = (win_rate - collision_rate) >= (prev_win_rate - prev_collision_rate)
+        if_save = avg_r >= prev_r
         if if_save:
             actor_ref = ray.put(self.agent.actor)
             critic_ref = ray.put(self.agent.critic)
@@ -92,98 +88,61 @@ class EvaluatorProc(object):
         return self.recorder
 
     def get_rewards_and_step(self) -> Tensor:
-        win_rate, collision_rate, rewards_steps_list = 0, 0, list()
+        rewards_steps_list = list()
         evaluate_run_ref = [evaluate.remote(self.env, self.agent.actor, i % len(self.args.pursuer_num) + 10, self.args) for i in range(self.num_cpus_eval)]
         for _ in range(self.eval_times):
             while len(evaluate_run_ref) > 0:
                 evaluate_ret_ref, evaluate_run_ref = ray.wait(evaluate_run_ref, num_returns=1, timeout=0.1)
                 if len(evaluate_ret_ref) > 0:
-                    win_tag, collision_tag, rewards_steps = ray.get(evaluate_ret_ref)[0]
-                    if win_tag:
-                        win_rate += 1
-                    if collision_tag:
-                        collision_rate += 1
-                
+                    rewards_steps = ray.get(evaluate_ret_ref)[0]
                     rewards_steps_list.append(rewards_steps)
-        win_rate /= self.num_cpus_eval
-        collision_rate /= self.num_cpus_eval
         rewards_steps_ten = torch.tensor(rewards_steps_list, dtype=torch.float32)
-        return win_rate, collision_rate, rewards_steps_ten  # rewards_steps_ten.shape[1] == 2
+        return rewards_steps_ten  # rewards_steps_ten.shape[1] == 2
 
 
 """util"""
 @ray.remote(num_cpus=1, num_gpus=0.001, resources={"node_-1": 0.001})
 def evaluate(env, actor, p_num, args):  #
-    win_tag = False
-    collision = False
     episode_reward = 0
-    
     device = next(actor.parameters()).device
-    hidden_state = torch.zeros(size=(args.num_layers, p_num, args.rnn_hidden_dim), dtype=torch.float32, device=device)
-    actor_last_comm_embedding = torch.zeros(size=(p_num, 2 * args.gnn_output_dim), dtype=torch.float32, device=device)
-
     env.reset(p_num=p_num, e_num=1)
-    o_num = env.boundary_obstacle_num
-    max_o_num = env.max_boundary_obstacle_num
     
-    # The hidden_state is initialized according to the shape of state
+    # The hidden_state is initialized
+    hidden_state = torch.zeros(size=(args.num_layers, p_num, args.rnn_hidden_dim), dtype=torch.float32, device=device)
+    # The historical embedding is initialized
+    history_embedding = [torch.zeros(size=(p_num, args.embedding_size), dtype=torch.float32, device=device) for _ in range(args.depth)]
+    actor_embedding_dataset = EmbeddingDataset(attribute=history_embedding, adjacent=None)
+    actor_current_embedding = torch.zeros(size=(p_num, args.embedding_size), dtype=torch.float32, device=device)
+    
+    o_state = env.boundary_obstacles
+    o_ten = torch.as_tensor(o_state, dtype=torch.float32).to(device)
     for step in range(args.episode_limit):
-        p_state = env.get_team_state(True, False)  # obs_n.shape=(N,obs_dim)
-        e_state = env.get_team_state(False, False)
+        p_state = env.get_state(agent_type='defender')  # obs_n.shape=(N,obs_dim)
+        e_state = env.get_state(agent_type='attacker')
         # the adjacent matrix of pursuer-pursuer, pursuer-obstacle, pursuer-evader
-        p_p_adj = env.communicate()  # shape of (p_num, p_num)
-        p_o_adj, p_e_adj = env.sensor(evader_pos=e_state)  # shape of (p_num, o_num), (p_num, e_num)
+        p_adj = env.communicate()  # shape of (p_num, p_num)
+        o_adj, e_adj = env.sensor()  # shape of (p_num, o_num), (p_num, e_num)
         # evader_step
         _, __ = env.evader_step()
-        # preprocess the state
-        state = list()
-        for s in range(p_num):
-            p_tmp = np.array(p_state)  # shape of (p_num, obs_dim)
-            # calculate relative p_state
-            p_s = np.array(p_state)  # shape of (p_num, obs_dim)
-            p_s = p_s - p_tmp[s]
-            # calculate relative e_state for every pursuer and mask
-            e_s = np.array(e_state)  # shape of (1, obs_dim)
-            e_s = e_s - p_tmp[s]
-            e_s = e_s.repeat(p_num, 0)  # repeat, shape of (p_num, obs_dim)
-            p_e_adj = np.array(p_e_adj).reshape((p_num, 1))
-            e_s = e_s * p_e_adj  # mask
-            # calculate relative o_state
-            o_s = np.array(env.boundary_obstacles)
-            padding_0 = np.zeros(shape=(o_num, 2))  # phi, v
-            o_s = np.concatenate([o_s, padding_0], axis=-1)
-            o_s = o_s - p_tmp[s]
+        # make the dataset
+        p_ten = torch.as_tensor(p_state, dtype=torch.float32).to(device)
+        e_ten = torch.as_tensor(e_state, dtype=torch.float32).to(device)
+        p_adj_ten = torch.as_tensor(p_adj, dtype=torch.float32).to(device)
+        e_adj_ten = torch.as_tensor(e_adj, dtype=torch.float32).to(device)
+        o_adj_ten = torch.as_tensor(o_adj, dtype=torch.float32).to(device)
 
-            # plan 1
-            padding_1 = np.zeros(shape=(o_num, 4))  # e_x, e_y, e_phi, e_v
-            o_s = np.concatenate([o_s, padding_1], axis=-1)
-            padding_2 = np.zeros(shape=(max_o_num - o_num, 8))
-            o_s = np.concatenate([o_s, padding_2], axis=0)
-            padding_3 = np.zeros(shape=(max_o_num, 1))
-            o_s = np.concatenate([padding_3, o_s], axis=-1)
-            
-            padding_4 = np.ones(shape=(p_num, 1), dtype=np.float64)
-            p_s = np.concatenate([padding_4, p_s, e_s], axis=-1)
-            relative_state = np.concatenate([p_s, o_s], axis=0)
-            state.append(relative_state.tolist())
-        # preprocess the adjacency matrix
-        p_p_adj = np.array(p_p_adj)
-        p_o_adj = np.array(p_o_adj)
-        adj = np.concatenate([p_p_adj, p_o_adj], axis=-1)
-        # Get actions and the corresponding log probabilities of N agents
-        state = torch.as_tensor(state, dtype=torch.float32).to(device)
-        adj = torch.as_tensor(adj, dtype=torch.float32).to(device)
-        a_n, hidden_state, actor_comm_embedding = actor.choose_action(state, adj, hidden_state, actor_last_comm_embedding, deterministic=True)
-        actor_last_comm_embedding = torch.concatenate((actor_last_comm_embedding[:, args.gnn_output_dim:], actor_comm_embedding), dim=-1)
+        attribute_dataset = AttributeDataset(attribute=[p_ten, e_ten, o_ten], adjacent=[p_adj_ten, e_adj_ten, o_adj_ten])
+        actor_embedding_dataset.update(attribute=actor_current_embedding, adjacent=p_adj_ten)
+
+        a_n, hidden_state, actor_current_embedding = actor.choose_action(attribute_dataset, actor_embedding_dataset, hidden_state, deterministic=True)
         # Take a step
         r, done, info = env.step(a_n.detach().cpu().numpy())
-        win_tag = True if done and not env.e_list['0'].active else False
         episode_reward += sum(r)
 
         if done:
             break
-    collision = env.collision
-    return win_tag, collision, [episode_reward, step]
+    # collision = env.collision
+    return [episode_reward, step]
 
 
 """learning curve"""
@@ -254,3 +213,54 @@ def draw_learning_curve(recorder: np.ndarray = None,
     # plt.show()  # if use `mpl.use('Agg')` to draw figures without GUI, then plt can't plt.show()
 
 
+class EmbeddingDataset(Dataset):
+    def __init__(self, attribute: list, adjacent: torch.Tensor):
+        self.attribute = attribute
+        self.adjacent = adjacent
+        
+    def __len__(self):
+        return len(self.attribute)
+    
+    def __getitem__(self, idx):
+        a1 = self.attribute[idx]
+        adj = self.adjacent
+        return a1, idx, adj
+    
+    def update(self, embedding, adj):
+        del self.attribute[0]
+        self.attribute.append(embedding)
+        self.adjacent = adj
+        
+        
+class AttributeDataset(Dataset):
+    def __init__(self, attribute: list, adjacent: list):
+        self.attribute = attribute
+        self.adjacent = adjacent
+        
+    def __len__(self):
+        return len(self.attribute)
+    
+    def __getitem__(self, idx):
+        a1 = self.attribute[0]
+        a2 = self.attribute[idx]
+        adj = self.adjacent[idx]
+        return a1, a2, idx, adj
+    
+
+class EmbeddingDataset(Dataset):
+    def __init__(self, attribute: list, adjacent: torch.Tensor):
+        self.attribute = attribute
+        self.adjacent = adjacent
+        
+    def __len__(self):
+        return len(self.attribute)
+    
+    def __getitem__(self, idx):
+        a1 = self.attribute[idx]
+        adj = self.adjacent
+        return a1, idx, adj
+    
+    def update(self, embedding, adj):
+        del self.attribute[0]
+        self.attribute.append(embedding)
+        self.adjacent = adj

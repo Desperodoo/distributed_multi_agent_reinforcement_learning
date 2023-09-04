@@ -12,7 +12,7 @@ import numpy as np
 from argparse import Namespace
 from torch.nn.utils import spectral_norm
 from torch.utils.data import Dataset, DataLoader
-from mappo.obstacle_differ_3hop.module.replay_buffer import MiniBuffer
+from mappo.obstacle_differ_3hop.module.replay_buffer import ReplayBuffer, BigBuffer
 from mappo.obstacle_differ_3hop.module.normalization import Normalization
 
 
@@ -49,20 +49,39 @@ class CustomMaxPool(nn.Module):
         return pooled_features
 
 
-class CustomDataset(Dataset):
-    def __init__(self, data, labels):
-        self.data = data
-        self.labels = labels
+class AttributeDataset(Dataset):
+    def __init__(self, attribute: list, adjacent: list):
+        self.attribute = attribute
+        self.adjacent = adjacent
         
     def __len__(self):
-        return len(self.data)
+        return len(self.attribute)
     
-    def __getitem__(self, index):
-        x = self.data[index]
-        y = self.labels[index]
-        z = self.adj[index]
-        return x, y, z
+    def __getitem__(self, idx):
+        a1 = self.attribute[0]
+        a2 = self.attribute[idx]
+        adj = self.adjacent[idx]
+        return a1, a2, idx, adj
     
+
+class EmbeddingDataset(Dataset):
+    def __init__(self, attribute: list, adjacent: torch.Tensor):
+        self.attribute = attribute
+        self.adjacent = adjacent
+        
+    def __len__(self):
+        return len(self.attribute)
+    
+    def __getitem__(self, idx):
+        a1 = self.attribute[idx]
+        adj = self.adjacent
+        return a1, idx, adj
+    
+    def update(self, embedding, adj):
+        del self.attribute[0]
+        self.attribute.append(embedding)
+        self.adjacent = adj
+
 
 class DHGN(nn.Module):
     def __init__(self, input_size, embedding_size, is_sn: bool, algo_config: Namespace, device):
@@ -144,7 +163,7 @@ class DHGN(nn.Module):
             self.LeakyReLU = nn.LeakyReLU()
             self.fcra_aggregate = self.att_operator
 
-    def fcra(self, h0: torch.Tensor, data_loader: Dataset) -> torch.Tensor:
+    def fcra(self, h0: torch.Tensor, data_loader: DataLoader) -> torch.Tensor:
         """
 
         Args:
@@ -152,7 +171,7 @@ class DHGN(nn.Module):
             data_loader (Dataset): get historical embeddings
             hk (torch.Tensor): historical embeddings (*, num_agent, feature_dim)
             adjacent_mat (torch.Tensor): (*, num_agent, num_agent)
-
+            historical_embedding (torch.Tensor): (*, num_agent, feature_dim)
         Returns:
             observation: (*, num_agent, 1, feature_dim)
         """
@@ -180,7 +199,7 @@ class DHGN(nn.Module):
         relative_coordinates = t1 - t2
         return relative_coordinates
 
-    def encoder(self, data_loader: Dataset) -> torch.Tensor:
+    def encoder(self, data_loader: DataLoader) -> torch.Tensor:
         """
         Args:
             data_loader (Dataset): _description_
@@ -227,7 +246,7 @@ class DHGN(nn.Module):
             semantic_level_embeddings = self.semantic_aggregate(layer=self.AGG_layers['AGG_semantic'], message=vertex_level_embeddings, adjacent_mat=adjacent_mat)
         return semantic_level_embeddings
 
-    def forward(self, attributes: Dataset, historical_embeddings: Dataset) -> torch.Tensor:
+    def forward(self, attributes: DataLoader, historical_embeddings: DataLoader) -> torch.Tensor:
         """_summary_
 
         Args:
@@ -310,7 +329,7 @@ class DHGN(nn.Module):
         embeddings = self.ReLU(torch.matmul(attention_score, layer(message)))
         return embeddings
 
-        
+
 class SharedActor(nn.Module):
     def __init__(self, shared_net, rnn_input_dim, output_size, num_layers, hidden_size, is_sn=False):
         super().__init__()
@@ -341,39 +360,38 @@ class SharedActor(nn.Module):
         #             output      : tensor of the shape (Steps, Batch * Num_of_Agent, Hidden_Size)
         #                                            => (Steps, Batch, Num_of_Agent, Hidden_Size)
         #                                            => (Batch, Steps, Num_of_Agent, Hidden_Size)            
-        comm_embedding = self.shared_net(state, last_comm_embedding, adj)
+        embedding = self.shared_net(state, last_comm_embedding, adj)
         # print('comm_embedding.shape', comm_embedding.shape)
         # print('last_comm_embedding.shape', last_comm_embedding.shape)
-        assert 2 * comm_embedding.shape[-1] == last_comm_embedding.shape[-1]
         # comm_embedding.shape == [*, agent_num, gnn_output_dim]
         
         if mode == 0:
-            feature = comm_embedding.unsqueeze(0)  # (Num_of_Agent, Middle_Size + Input_Size) => (1, Num_of_Agent, Middle_Size + Input_Size)
+            feature = embedding.unsqueeze(0)  # (Num_of_Agent, Middle_Size + Input_Size) => (1, Num_of_Agent, Middle_Size + Input_Size)
             feature, hidden_state = self.GRU(feature, hidden_state)
             feature = feature.squeeze(0)
         else:
-            batch = comm_embedding.shape[0]
-            steps = comm_embedding.shape[1]
-            num_agent = comm_embedding.shape[2]
+            batch = embedding.shape[0]
+            steps = embedding.shape[1]
+            num_agent = embedding.shape[2]
 
-            feature = comm_embedding.permute(1, 0, 2, 3)  # (Batch, Steps, Num_of_Agent, Middle_Size + Input_Size) => (Steps, Batch, Num_of_Agent, Middle_Size + Input_Size)
+            feature = embedding.permute(1, 0, 2, 3)  # (Batch, Steps, Num_of_Agent, Middle_Size + Input_Size) => (Steps, Batch, Num_of_Agent, Middle_Size + Input_Size)
             feature = feature.reshape((steps, -1, self.rnn_input_size))  # (Steps, Batch, Num_of_Agent, Middle_Size + Input_Size) => (Steps, Batch * Num_of_Agent, Middle_Size + Input_Size)
             feature, hidden_state = self.GRU(feature, hidden_state)
             feature = feature.reshape((steps, batch, num_agent, self.hidden_size))  # (Steps, Batch, Num_of_Agent, Hidden_Size) <= (Steps, Batch * Num_of_Agent, Hidden_Size)
             feature = feature.permute(1, 0, 2, 3)  # (Batch, Steps, Num_of_Agent, Hidden_Size) <= (Steps, Batch, Num_of_Agent, Hidden_Size)
         prob = torch.softmax(self.Mean(feature), dim=-1)
-        return prob, hidden_state, comm_embedding
+        return prob, hidden_state, embedding
 
     def choose_action(self, state, adj, hidden_state, last_comm_embedding, deterministic=True):
-        prob, hidden_state, comm_embedding = self.forward(state, adj, hidden_state, last_comm_embedding, mode=0)
+        prob, hidden_state, embedding = self.forward(state, adj, hidden_state, last_comm_embedding, mode=0)
         if deterministic:
             action = prob.argmax(dim=-1, keepdim=False)
-            return action, hidden_state, comm_embedding
+            return action, hidden_state, embedding
         else:
             dist = Categorical(probs=prob)
             a_n = dist.sample()
             a_logprob_n = dist.log_prob(a_n)
-            return a_n, a_logprob_n, hidden_state, comm_embedding
+            return a_n, a_logprob_n, hidden_state, embedding
 
     def get_logprob_and_entropy(self, state, adj, hidden_state, last_comm_embedding, action):
         prob, _, __ = self.forward(state, adj, hidden_state, last_comm_embedding, mode=1)
@@ -434,22 +452,20 @@ class SharedCritic(nn.Module):
         device = next(self.shared_net.parameters()).device
         connected_adj = torch.ones_like(input=adj, device=device)
         # comm_embedding: tensor of the shape ()
-        comm_embedding = self.shared_net(state, last_comm_embedding, connected_adj)
+        embedding = self.shared_net(state, last_comm_embedding, connected_adj)
         
-        assert 2 * comm_embedding.shape[-1] == last_comm_embedding.shape[-1]
-
         if mode == 0:
-            feature = comm_embedding.unsqueeze(0)  # (Num_of_Agent, Hidden_Size) => (1, Num_of_Agent, Hidden_Size)
+            feature = embedding.unsqueeze(0)  # (Num_of_Agent, Hidden_Size) => (1, Num_of_Agent, Hidden_Size)
             feature, hidden_state = self.GRU(feature, hidden_state)
             feature = feature.squeeze(0)
             val = self.Mean(feature)
-            return val, hidden_state, comm_embedding
+            return val, hidden_state, embedding
 
         else:
-            batch = comm_embedding.shape[0]
-            steps = comm_embedding.shape[1]
-            num_agent = comm_embedding.shape[2]            
-            feature = comm_embedding.permute(1, 0, 2, 3)  # (Batch, Steps, Num_of_Agent, Middle_Size) => (Steps, Batch, Num_of_Agent, Middle_Size)
+            batch = embedding.shape[0]
+            steps = embedding.shape[1]
+            num_agent = embedding.shape[2]            
+            feature = embedding.permute(1, 0, 2, 3)  # (Batch, Steps, Num_of_Agent, Middle_Size) => (Steps, Batch, Num_of_Agent, Middle_Size)
             feature = feature.reshape((steps, -1, self.rnn_input_size))  # (Steps, Batch, Num_of_Agent, Middle_Size) => (Steps, Batch * Num_of_Agent, Middle_Size)
             feature, hidden_state = self.GRU(feature, hidden_state)
             feature = feature.reshape((steps, batch, num_agent, self.hidden_size))  # (Steps, Batch, Num_of_Agent, Hidden_Size) <= (Steps, Batch * Num_of_Agent, Hidden_Size)
@@ -492,8 +508,8 @@ class MAPPO:
         self.use_adv_norm = args.use_adv_norm
         self.use_value_clip = args.use_value_clip
         # get the input dimension of actor and critic
-        self.actor_input_dim = args.state_dim + 1
-        self.critic_input_dim = args.state_dim + 1
+        self.actor_input_dim = args.state_dim
+        self.critic_input_dim = args.state_dim
         self.num_layers = args.num_layers
         self.gnn_output_dim = args.gnn_output_dim
         self.rnn_input_dim = args.gnn_output_dim
@@ -508,9 +524,7 @@ class MAPPO:
 
         if args.use_reward_norm:
             # print("------use reward norm------")
-            self.reward_norm = dict()
-            for i in args.pursuer_num:
-                self.reward_norm[f'{i}'] = Normalization(shape=i)
+            self.reward_norm = Normalization(shape=args.pursuer_num)
 
         # if self.use_agent_specific:
         #     print("------use agent specific global state------")
@@ -564,92 +578,71 @@ class MAPPO:
     def train(self, replay_buffer, total_steps):
         self.actor = self.actor.to(self.device)
         # Optimize policy for K epochs:
-        adv_list = list()
-        v_target_list = list()
-        for i in self.args.pursuer_num:  # 5-15
-            batch, max_episode_len = replay_buffer.get_training_data(i, self.device)  # Transform the data into tensor
-            # Calculate the advantage using GAE
-            adv = []
-            gae = 0
-            with torch.no_grad():  # adv and v_target have no gradient
-                # deltas.shape=(batch_size,max_episode_len,N)
-                deltas = batch['r'] + self.gamma * batch['v_n'][:, 1:] - batch['v_n'][:, :-1]
-                deltas = deltas * batch['active']
-                for t in reversed(range(max_episode_len)):
-                    gae = deltas[:, t] + self.gamma * self.lamda * gae
-                    adv.insert(0, gae)
-                adv = torch.stack(adv, dim=1)  # adv.shape(batch_size,max_episode_len,N)
-                v_target = adv + batch['v_n'][:, :-1]  # v_target.shape(batch_size,max_episode_len,N)
-                # print(deltas)
-                # print(batch['active'])
-                # print(adv)
-                if self.use_adv_norm:  # Trick 1: advantage normalization
-                    mean = adv.mean()
-                    std = adv.std()
-                    adv = (adv - mean) / (std + 1e-5) * batch['active']
-                    # print(adv)
-            v_target_list.append(v_target)
-            adv_list.append(adv)
-            """
-                Get actor_inputs and critic_inputs
-                actor_inputs.shape=(batch_size, max_episode_len, N, actor_input_dim)
-                critic_inputs.shape=(batch_size, max_episode_len, N, critic_input_dim)
-            """
+        batch, max_episode_len = replay_buffer.get_training_data(self.device)  # Transform the data into tensor
+        # Calculate the advantage using GAE
+        adv = []
+        gae = 0
+        with torch.no_grad():  # adv and v_target have no gradient
+            # deltas.shape=(batch_size,max_episode_len,N)
+            deltas = batch['r'] + self.gamma * batch['v_n'][:, 1:] - batch['v_n'][:, :-1]
+            deltas = deltas * batch['active']
+            for t in reversed(range(max_episode_len)):
+                gae = deltas[:, t] + self.gamma * self.lamda * gae
+                adv.insert(0, gae)
+            adv = torch.stack(adv, dim=1)  # adv.shape(batch_size,max_episode_len,N)
+            v_target = adv + batch['v_n'][:, :-1]  # v_target.shape(batch_size,max_episode_len,N)
+
+            if self.use_adv_norm:  # Trick 1: advantage normalization
+                mean = adv.mean()
+                std = adv.std()
+                adv = (adv - mean) / (std + 1e-5) * batch['active']
+                
         object_critics = 0.0
         object_actors = 0.0
         update_time = 0
-
         self.ac_optimizer.zero_grad()
         
-        for i, num in enumerate(self.args.pursuer_num):  # 5-15
-            batch, _ = replay_buffer.get_training_data(num, self.device)  # Transform the data into tensor
-            for index in BatchSampler(SequentialSampler(range(self.batch_size)), self.mini_batch_size, False):
-                # print('index: ', index)
-                """
-                    Get probs_now and values_now
-                    probs_now.shape=(mini_batch_size, max_episode_len, N, action_dim)
-                    values_now.shape=(mini_batch_size, max_episode_len, N)
-                """
-                actor_hidden_state = torch.zeros(
-                    size=(self.num_layers, len(index) * num, self.rnn_hidden_dim),
-                    dtype=torch.float32,
-                    device=self.device
-                )
-                critic_hidden_state = torch.zeros(
-                    size=(self.num_layers, len(index) * num, self.rnn_hidden_dim),
-                    dtype=torch.float32,
-                    device=self.device
-                )
-                a_logprob_n_now, dist_entropy = self.actor.get_logprob_and_entropy(batch['state'][index], batch['adj'][index], actor_hidden_state, batch['actor_comm_embedding'][index], batch['a_n'][index])
-                # dist_entropy.shape=(mini_batch_size, max_episode_len, N)
-                # a_logprob_n_now.shape=(mini_batch_size, max_episode_len, N)
-                # batch['a_n'][index].shape=(mini_batch_size, max_episode_len, N)
-                values_now = self.critic(batch['state'][index], batch['adj'][index], critic_hidden_state, batch['critic_comm_embedding'][index], mode=1).squeeze(-1)
+        for index in BatchSampler(SequentialSampler(range(self.batch_size)), self.mini_batch_size, False):
+            actor_hidden_state = torch.zeros(
+                size=(self.num_layers, len(index) * self.args.num_defender, self.rnn_hidden_dim),
+                dtype=torch.float32,
+                device=self.device
+            )
+            critic_hidden_state = torch.zeros(
+                size=(self.num_layers, len(index) * self.args.num_defender, self.rnn_hidden_dim),
+                dtype=torch.float32,
+                device=self.device
+            )
+            a_logprob_n_now, dist_entropy = self.actor.get_logprob_and_entropy(batch['state'][index], batch['adj'][index], actor_hidden_state, batch['actor_comm_embedding'][index], batch['a_n'][index])
+            # dist_entropy.shape=(mini_batch_size, max_episode_len, N)
+            # a_logprob_n_now.shape=(mini_batch_size, max_episode_len, N)
+            # batch['a_n'][index].shape=(mini_batch_size, max_episode_len, N)
+            values_now = self.critic(batch['state'][index], batch['adj'][index], critic_hidden_state, batch['critic_comm_embedding'][index], mode=1).squeeze(-1)
 
-                ratios = torch.exp(a_logprob_n_now - batch['a_logprob_n'][index].detach())  # Attention! Attention! 'a_log_prob_n' should be detached.
-                # ratios.shape=(mini_batch_size, max_episode_len, N)
-                surr1 = ratios * adv_list[i][index]
-                surr2 = torch.clamp(ratios, 1 - self.epsilon, 1 + self.epsilon) * adv_list[i][index]
-                actor_loss = -torch.min(surr1, surr2) - self.entropy_coef * dist_entropy
-                actor_loss = (actor_loss * batch['active'][index]).sum() / batch['active'][index].sum()
+            ratios = torch.exp(a_logprob_n_now - batch['a_logprob_n'][index].detach())  # Attention! Attention! 'a_log_prob_n' should be detached.
+            # ratios.shape=(mini_batch_size, max_episode_len, N)
+            surr1 = ratios * adv[index]
+            surr2 = torch.clamp(ratios, 1 - self.epsilon, 1 + self.epsilon) * adv[index]
+            actor_loss = -torch.min(surr1, surr2) - self.entropy_coef * dist_entropy
+            actor_loss = (actor_loss * batch['active'][index]).sum() / batch['active'][index].sum()
 
-                if self.use_value_clip:
-                    values_old = batch["v_n"][index, :-1].detach()
-                    values_error_clip = torch.clamp(values_now - values_old, -self.epsilon, self.epsilon) + values_old - v_target_list[i][index]
-                    values_error_original = values_now - v_target_list[i][index]
-                    critic_loss = torch.max(values_error_clip ** 2, values_error_original ** 2)
-                else:
-                    critic_loss = (values_now - v_target_list[i][index]) ** 2
-                critic_loss = (critic_loss * batch['active'][index]).sum() / batch['active'][index].sum()
-                
-                ac_loss = actor_loss + critic_loss
-                ac_loss.backward()
-                if self.use_grad_clip:  # Trick 7: Gradient clip
-                    torch.nn.utils.clip_grad_norm_(self.ac_parameters, 10.0)
-                
-                object_critics += critic_loss.item()
-                object_actors += actor_loss.item()
-                update_time += 1
+            if self.use_value_clip:
+                values_old = batch["v_n"][index, :-1].detach()
+                values_error_clip = torch.clamp(values_now - values_old, -self.epsilon, self.epsilon) + values_old - v_target[index]
+                values_error_original = values_now - v_target[index]
+                critic_loss = torch.max(values_error_clip ** 2, values_error_original ** 2)
+            else:
+                critic_loss = (values_now - v_target[index]) ** 2
+            critic_loss = (critic_loss * batch['active'][index]).sum() / batch['active'][index].sum()
+            
+            ac_loss = actor_loss + critic_loss
+            ac_loss.backward()
+            if self.use_grad_clip:  # Trick 7: Gradient clip
+                torch.nn.utils.clip_grad_norm_(self.ac_parameters, 10.0)
+            
+            object_critics += critic_loss.item()
+            object_actors += actor_loss.item()
+            update_time += 1
                 
         if self.use_lr_decay:
             self.lr_decay(total_steps)
@@ -669,7 +662,7 @@ class MAPPO:
         collision_rate = 0.0
         exp_reward = 0.0
         sample_steps = 0
-        self.minibuffer = MiniBuffer(buffer_id, args=self.args)
+        self.minibuffer = ReplayBuffer(buffer_id, args=self.args)
         self.minibuffer.reset_buffer(p_num=p_num, o_num=env.max_boundary_obstacle_num, p_obs_dim=4, e_obs_dim=4, action_dim=9)
         for k in range(num_episode):
             win_tag, collision, episode_reward, episode_steps = self.run_episode(env, map_info, p_num=p_num, num_episode=k, idx=buffer_id)  # 5 + i % 11
@@ -680,147 +673,76 @@ class MAPPO:
         return p_num, win_rate / num_episode, collision_rate / num_episode, exp_reward / num_episode, self.minibuffer, sample_steps
     
     def run_episode(self, env, map_info, p_num=15, num_episode=0, idx=0):  #
-        win_tag = False
-        collision = False
         episode_reward = 0
-
         env.reset(p_num=p_num, e_num=1, worker_id=idx, map_info=map_info)
-        o_num = env.boundary_obstacle_num
-        max_o_num = env.max_boundary_obstacle_num
 
-        # The hidden_state is initialized according to the shape of state
+        # The hidden_state is initialized
         actor_hidden_state = torch.zeros(size=(self.num_layers, p_num, self.rnn_hidden_dim), dtype=torch.float32, device=self.device)
         critic_hidden_state = torch.zeros(size=(self.num_layers, p_num, self.rnn_hidden_dim), dtype=torch.float32, device=self.device)
-        # The last_comm_embedding is initialized
-        actor_last_comm_embedding = torch.zeros(size=(p_num, 2 * self.gnn_output_dim), dtype=torch.float32, device=self.device)
-        critic_last_comm_embedding = torch.zeros(size=(p_num, 2 * self.gnn_output_dim), dtype=torch.float32, device=self.device)
+        # The historical embedding is initialized
+        history_embedding = [torch.zeros(size=(p_num, self.embedding_size), dtype=torch.float32, device=self.device) for _ in range(self.depth)]
+        actor_embedding_dataset = EmbeddingDataset(attribute=history_embedding, adjacent=None)
+        critic_embedding_dataset = EmbeddingDataset(attribute=history_embedding, adjacent=None)
+        actor_current_embedding = torch.zeros(size=(p_num, self.embedding_size), dtype=torch.float32, device=self.device)
+        critic_current_embedding = torch.zeros(size=(p_num, self.embedding_size), dtype=torch.float32, device=self.device)
+        
+        o_state = env.boundary_obstacles
+        o_ten = torch.as_tensor(o_state, dtype=torch.float32).to(self.device)
         for episode_step in range(self.args.episode_limit):
-            p_state = env.get_team_state(True, False)  # obs_n.shape=(N,obs_dim)
-            e_state = env.get_team_state(False, False)
-            # the adjacent matrix of pursuer-pursuer, pursuer-obstacle, pursuer-evader
-            p_p_adj = env.communicate()  # shape of (p_num, p_num)
-            p_o_adj, p_e_adj = env.sensor(evader_pos=e_state)  # shape of (p_num, o_num), (p_num, e_num)
-            active = env.get_active()
+            p_state = env.get_state(agent_type='defender')  # obs_n.shape=(N,obs_dim)
+            e_state = env.get_state(agent_type='attacker')
+            
+            p_adj = env.communicate()  # shape of (p_num, p_num)
+            o_adj, e_adj = env.sensor()  # shape of (p_num, o_num), (p_num, e_num)
             # evader_step
             _, __ = env.evader_step(idx)
-            # preprocess the state
-            state = list()
-            for s in range(p_num):
-                p_tmp = np.array(p_state)  # shape of (p_num, obs_dim)
-                # calculate relative p_state
-                p_s = np.array(p_state)  # shape of (p_num, obs_dim)
-                p_s = p_s - p_tmp[s]
-                # calculate relative e_state for every pursuer and mask
-                e_s = np.array(e_state)  # shape of (1, obs_dim)
-                e_s = e_s - p_tmp[s]
-                e_s = e_s.repeat(p_num, 0)  # repeat, shape of (p_num, obs_dim)
-                p_e_adj = np.array(p_e_adj).reshape((p_num, 1))
-                e_s = e_s * p_e_adj  # mask
-                # calculate relative o_state
-                o_s = np.array(env.boundary_obstacles)
-                padding_0 = np.zeros(shape=(o_num, 2))  # phi, v
-                o_s = np.concatenate([o_s, padding_0], axis=-1)
-                o_s = o_s - p_tmp[s]
-                # plan 1
-                padding_1 = np.zeros(shape=(o_num, 4))  # e_x, e_y, e_phi, e_v
-                o_s = np.concatenate([o_s, padding_1], axis=-1)
-                padding_2 = np.zeros(shape=(max_o_num - o_num, 8))
-                o_s = np.concatenate([o_s, padding_2], axis=0)
-                padding_3 = np.zeros(shape=(max_o_num, 1))
-                o_s = np.concatenate([padding_3, o_s], axis=-1)
-                
-                padding_4 = np.ones(shape=(p_num, 1), dtype=np.float64)
-                p_s = np.concatenate([padding_4, p_s, e_s], axis=-1)
-                relative_state = np.concatenate([p_s, o_s], axis=0)
-                state.append(relative_state.tolist())
+            # make the dataset
+            p_ten = torch.as_tensor(p_state, dtype=torch.float32).to(self.device)
+            e_ten = torch.as_tensor(e_state, dtype=torch.float32).to(self.device)
+            p_adj_ten = torch.as_tensor(p_adj, dtype=torch.float32).to(self.device)
+            e_adj_ten = torch.as_tensor(e_adj, dtype=torch.float32).to(self.device)
+            o_adj_ten = torch.as_tensor(o_adj, dtype=torch.float32).to(self.device)
 
-            # preprocess the adjacency matrix
-            p_p_adj = np.array(p_p_adj)
-            p_o_adj = np.array(p_o_adj)
-            adj = np.concatenate([p_p_adj, p_o_adj], axis=-1)
-            # Get actions and the corresponding log probabilities of N agents            
-            state = torch.as_tensor(state, dtype=torch.float32).to(self.device)
-            adj = torch.as_tensor(adj, dtype=torch.float32).to(self.device)
-            # actor_comm_embedding.shape = [p_num, self.gnn_output_dim]
-            a_n, a_logprob_n, actor_hidden_state, actor_comm_embedding = self.actor.choose_action(state, adj, actor_hidden_state, actor_last_comm_embedding, deterministic=False)
-            v_n, critic_hidden_state, critic_comm_embedding = self.critic(state, adj, critic_hidden_state, critic_last_comm_embedding, mode=0)  # Get the state values (V(s)) of N agents
+            attribute_dataset = AttributeDataset(attribute=[p_ten, e_ten, o_ten], adjacent=[p_adj_ten, e_adj_ten, o_adj_ten])
+            actor_embedding_dataset.update(attribute=actor_current_embedding, adjacent=p_adj_ten)
+            critic_embedding_dataset.update(attribute=critic_current_embedding, adjacent=p_adj_ten)
+
+            a_n, a_logprob_n, actor_hidden_state, actor_current_embedding = self.actor.choose_action(attribute_dataset, actor_embedding_dataset, actor_hidden_state, deterministic=False)
+            v_n, critic_hidden_state, critic_current_embedding = self.critic(attribute_dataset, critic_embedding_dataset, critic_hidden_state, mode=0)  # Get the state values (V(s)) of N agents
             # Take a step    
             r, done, info = env.step(a_n.detach().cpu().numpy())  # Take a step
-            win_tag = True if done and not env.e_list['0'].active else False
             episode_reward += sum(r)
-
             r = self.reward_norm[f'{p_num}'](r)  # TODO: Dynamic shape
-
             # Store the transition
             r = torch.as_tensor(r, dtype=torch.float32).to(self.device)
             active = torch.as_tensor(active, dtype=torch.float32).to(self.device)
-            win = torch.as_tensor(win_tag, dtype=torch.float32).to(self.device)
             self.minibuffer.store_transition(
-                num_episode, episode_step, state, adj, actor_last_comm_embedding, critic_last_comm_embedding, v_n.flatten(), a_n.flatten(), a_logprob_n.flatten(), r, active, win
+                num_episode, episode_step, p_ten, e_ten, o_ten, p_adj, e_adj, o_adj, actor_current_embedding, critic_current_embedding, v_n.flatten(), a_n.flatten(), a_logprob_n.flatten(), r, active
             )
-            actor_last_comm_embedding = torch.concatenate((actor_last_comm_embedding[:, self.args.gnn_output_dim:], actor_comm_embedding), dim=-1)
-            critic_last_comm_embedding = torch.concatenate((critic_last_comm_embedding[:, self.args.gnn_output_dim:], critic_comm_embedding), dim=-1)
             if done:
                 break
-        collision = env.collision
+            
+        # collision = env.collision
         # An episode is over, store obs_n, s and avail_a_n in the last step
-        p_state = env.get_team_state(True, False)  # obs_n.shape=(N,obs_dim)
-        e_state = env.get_team_state(False, False)
+        p_state = env.get_state(agent_type='defender')  # obs_n.shape=(N,obs_dim)
+        e_state = env.get_state(agent_type='attacker')
         # the adjacent matrix of pursuer-pursuer, pursuer-obstacle, pursuer-evader
-        p_p_adj = env.communicate()  # shape of (p_num, p_num)
-        p_o_adj, p_e_adj = env.sensor(evader_pos=e_state)  # shape of (p_num, o_num), (p_num, e_num)
-        # preprocess the state
-        state = list()
-        for s in range(p_num):
-            p_tmp = np.array(p_state)  # shape of (p_num, obs_dim)
-            # calculate relative p_state
-            p_s = np.array(p_state)  # shape of (p_num, obs_dim)
-            p_s = p_s - p_tmp[s]
-            # calculate relative e_state for every pursuer and mask
-            e_s = np.array(e_state)  # shape of (1, obs_dim)
-            e_s = e_s - p_tmp[s]
-            e_s = e_s.repeat(p_num, 0)  # repeat, shape of (p_num, obs_dim)
-            p_e_adj = np.array(p_e_adj).reshape((p_num, 1))
-            e_s = e_s * p_e_adj  # mask
-            # calculate relative o_state
-            o_s = np.array(env.boundary_obstacles)
-            padding_0 = np.zeros(shape=(o_num, 2))  # phi, v
-            o_s = np.concatenate([o_s, padding_0], axis=-1)
-            o_s = o_s - p_tmp[s]
-            
-            # plan 1
-            padding_1 = np.zeros(shape=(o_num, 4))  # e_x, e_y, e_phi, e_v
-            o_s = np.concatenate([o_s, padding_1], axis=-1)
-            padding_2 = np.zeros(shape=(max_o_num - o_num, 8))
-            o_s = np.concatenate([o_s, padding_2], axis=0)
-            padding_3 = np.zeros(shape=(max_o_num, 1))
-            o_s = np.concatenate([padding_3, o_s], axis=-1)
-            
-            padding_4 = np.ones(shape=(p_num, 1), dtype=np.float64)
-            p_s = np.concatenate([padding_4, p_s, e_s], axis=-1)
-            relative_state = np.concatenate([p_s, o_s], axis=0)
-            state.append(relative_state.tolist())
-            
-        # preprocess the adjacency matrix
-        p_p_adj = np.array(p_p_adj)
-        p_o_adj = np.array(p_o_adj)
-        adj = np.concatenate([p_p_adj, p_o_adj], axis=-1)
-        # Get actions and the corresponding log probabilities of N agents
-        state = torch.as_tensor(state, dtype=torch.float32).to(self.device)
-        adj = torch.as_tensor(adj, dtype=torch.float32).to(self.device)
-        v_n, critic_hidden_state, _ = self.critic(state, adj, critic_hidden_state, critic_last_comm_embedding, mode=0)
+        p_adj = env.communicate()  # shape of (p_num, p_num)
+        o_adj, e_adj = env.sensor(evader_pos=e_state)  # shape of (p_num, o_num), (p_num, e_num)            
+        # make the dataset
+        p_ten = torch.as_tensor(p_state, dtype=torch.float32).to(self.device)
+        e_ten = torch.as_tensor(e_state, dtype=torch.float32).to(self.device)
+        p_adj_ten = torch.as_tensor(p_adj, dtype=torch.float32).to(self.device)
+        e_adj_ten = torch.as_tensor(e_adj, dtype=torch.float32).to(self.device)
+        o_adj_ten = torch.as_tensor(o_adj, dtype=torch.float32).to(self.device)
+
+        attribute_dataset = AttributeDataset(attribute=[p_ten, e_ten, o_ten], adjacent=[p_adj_ten, e_adj_ten, o_adj_ten])
+        critic_embedding_dataset.update(attribute=critic_current_embedding, adjacent=p_adj_ten)
+        v_n, critic_hidden_state, critic_current_embedding = self.critic(attribute_dataset, critic_embedding_dataset, critic_hidden_state, mode=0)  # Get the state values (V(s)) of N agents
         self.minibuffer.store_last_value(num_episode, episode_step + 1, v_n.flatten())
 
-        return win_tag, collision, episode_reward, episode_step + 1
+        return episode_reward, episode_step + 1
 
     def save_model(self, cwd):
         torch.save(self.actor.state_dict(), cwd + 'actor.pth')
         torch.save(self.critic.state_dict(), cwd + 'critic.pth')
-
-    # def save_best_model(self, cwd):
-    #     torch.save(self.actor.state_dict(), cwd + 'actor_best.pth')
-    #     torch.save(self.critic.state_dict(), cwd + 'critic_best.pth')
-
-    # def load_pretrain_model(self, pretrain_model_cwd):
-    #     self.actor.load_state_dict(torch.load(pretrain_model_cwd + 'pretrain_actor.pth'))
-    #     self.critic.load_state_dict(torch.load(pretrain_model_cwd + 'pretrain_actor.pth'))    
