@@ -1,0 +1,75 @@
+main: null
+env:
+  env_class:
+    _target_: environment.pursuit_evasion_game.env_2d.pursuit_env.Pursuit_Env
+  name: Pursuit_Env
+  max_steps: 3
+  hidden_size: 256
+  state_dim: 4
+  action_dim: 9
+sensor:
+  num_beams: 36
+  radius: 8
+map:
+  center:
+    x: 30
+    'y': 30
+  map_size:
+    x: 60
+    'y': 60
+  num_obstacle_block: 5
+  resolution: 1
+  variance: 10
+  num_max_obstacle: 110
+attacker:
+  DOF: 2
+  collision_radius: 0.5
+  comm_range: 16
+  sen_range: 8
+  step_size: 0.1
+  tau: 0.2
+  vmax: 4
+  extend_dis: 3
+defender:
+  DOF: 2
+  collision_radius: 0.5
+  comm_range: 16
+  sen_range: 8
+  step_size: 0.1
+  tau: 0.2
+  vmax: 2
+algo:
+  agent_class:
+    _target_: DHGN.mappo_parallel.MAPPO
+  pretrain_model_cwd: ./pretrain/experiment/pretrain_model_15
+  learner_device: cuda
+  worker_device: cpu
+  evaluator_device: cpu
+  max_train_steps: 200000000
+  lr: 0.0005
+  gamma: 0.99
+  lamda: 0.95
+  epsilon: 0.05
+  epochs: 1
+  entropy_coef: 0.05
+  save_cwd: ./model
+  evaluate_times: 2
+  sample_epi_num: 1
+  use_adv_norm: true
+  use_agent_specific: true
+  use_grad_clip: true
+  use_lr_decay: true
+  use_orthogonal_init: true
+  use_reward_norm: true
+  use_spectral_norm: true
+  use_value_clip: true
+  set_adam_eps: true
+  mlp_hidden_dim: 128
+  rnn_hidden_dim: 128
+  embedding_dim: 128
+  num_layers: 2
+  semantic_level_aggregator: mean
+  vertex_level_aggregator: mean
+  fcra_aggregator: mean
+  depth: 3
+  num_relation: 3

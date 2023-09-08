@@ -1,0 +1,10 @@
+DOF: 2
+collision_radius: 0.5
+comm_range: 16
+extend_dis: 3
+sen_range: 8
+step_size: 0.1
+tau: 0.2
+vmax: 4
+x_dim: 60
+y_dim: 60

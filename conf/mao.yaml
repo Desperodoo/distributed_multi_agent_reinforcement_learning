@@ -1,0 +1,11 @@
+center: !!python/tuple
+- 30
+- 30
+is3D: false
+map_size: !!python/tuple
+- 60
+- 60
+max_num_obstacle: 110
+num_obstacle_block: 5
+resolution: 1
+variance: 10

@@ -1,0 +1,3 @@
+my_class:
+  _target_: my_module.MyClass
+  param1: value1

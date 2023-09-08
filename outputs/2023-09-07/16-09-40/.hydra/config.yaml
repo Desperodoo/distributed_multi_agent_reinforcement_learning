@@ -1,0 +1,3 @@
+my_class:
+  _target_: test.MyClass
+  param1: value1
