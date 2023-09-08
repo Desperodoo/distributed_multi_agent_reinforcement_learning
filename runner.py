@@ -12,16 +12,16 @@ from DHGN.mappo_parallel import MAPPO
 
 @ray.remote(num_cpus=1, num_gpus=0.001)
 class Learner(object):
-    def __init__(self, args, batch_size, mini_batch_size, learner_id):
+    def __init__(self, cfg, batch_size, mini_batch_size, learner_id):
         self.learner_id = learner_id
         self.total_steps = 0
-        self.agent = hydra.utils.instantiate(args.algo.agent_class, args=args, batch_size=batch_size, mini_batch_size=mini_batch_size, agent_type="Learner")
-        self.buffer = BigBuffer(args=args)
-        self.cwd = args.algo.save_cwd
+        self.agent = hydra.utils.instantiate(cfg.algo.agent_class, cfg, batch_size, mini_batch_size, "Learner")
+        self.buffer = BigBuffer()
+        self.cwd = cfg.algo.save_cwd
         if not os.path.exists(self.cwd):
             os.makedirs(self.cwd)
-        self.learner_device = torch.device(args.algo.learner_device)
-        self.use_lr_decay = args.algo.use_lr_decay
+        self.learner_device = torch.device(cfg.algo.learner_device)
+        self.use_lr_decay = cfg.algo.use_lr_decay
         print("Learner is Activated")
 
     def collect_buffer(self, worker_run_ref):
@@ -79,13 +79,13 @@ class Learner(object):
 
 @ray.remote(num_cpus=1, num_gpus=0.001)
 class Worker(object):
-    def __init__(self, worker_id: int, args):
+    def __init__(self, worker_id: int, cfg):
         self.worker_id = worker_id
-        self.env = hydra.utils.instantiate(args.env.env_class, conf=args)
-        self.agent = hydra.utils.instantiate(args.algo.agent_class, args, None, None, "Worker")
-        self.sample_epi_num = args.algo.sample_epi_num
+        self.env = hydra.utils.instantiate(cfg.env.env_class, cfg)
+        self.agent = hydra.utils.instantiate(cfg.algo.agent_class, cfg, None, None, "Worker")
+        self.sample_epi_num = cfg.algo.sample_epi_num
 
-    def run(self, actor_weights, critic_weights, map_info):
+    def run(self, actor_weights, critic_weights):
         warnings.filterwarnings("ignore", message="Values in x were outside bounds during a minimize step, clipping to bounds")
         worker_id = self.worker_id
         torch.set_grad_enabled(False)
@@ -93,5 +93,5 @@ class Worker(object):
         self.agent.actor.set_weights(actor_weights)
         self.agent.critic.set_weights(critic_weights)
         '''Worker send the training data to Learner'''
-        exp_reward, buffer_items, steps = self.agent.explore_env(self.env, worker_id, self.sample_epi_num, map_info)
+        exp_reward, buffer_items, steps = self.agent.explore_env(self.env, self.sample_epi_num)
         return exp_reward, buffer_items, steps

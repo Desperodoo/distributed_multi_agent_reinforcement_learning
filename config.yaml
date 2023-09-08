@@ -18,7 +18,7 @@ env:
   action_dim: 9
   attacker_class: Evader
   defender_class: Pursuer
-  max_steps: 150
+  max_steps: 50
   num_attacker: 1
   num_defender: 15
   num_target: 1
@@ -32,7 +32,7 @@ map:
   num_obstacle_block: 8
   resolution: 1
   variance: 10
-  num_max_obstacle: 110
+  num_max_obstacle: 176
 attacker:
   DOF: 2
   collision_radius: 0.5
@@ -68,7 +68,7 @@ algo:
   entropy_coef: 0.05
   save_cwd: './model'
   # Evaluator
-  evaluate_times: 2
+  evaluate_times: 10
   # Worker
   sample_epi_num: 1
   # Tricks

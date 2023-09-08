@@ -67,7 +67,7 @@ class AStar_2D:
             try:
                 path = self.extract_path(self.PARENT)
             except:
-                print('No path found')
+                # print('No path found')
                 path = [s_start]
 
         return path, self.CLOSED

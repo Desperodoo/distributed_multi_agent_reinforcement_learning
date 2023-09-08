@@ -17,15 +17,15 @@ from environment.pursuit_evasion_game.gif_plotting import sim_moving
 
 @ray.remote(num_cpus=1, num_gpus=0.001)
 class EvaluatorProc(object):
-    def __init__(self, args, num_cpus_eval):
-        self.env = hydra.utils.instantiate(args.env.env_class, args)
-        self.agent = hydra.utils.instantiate(args.algo.agent_class, args=args, batch_size=None, mini_batch_size=None, agent_type="Evaluator")
+    def __init__(self, cfg, num_cpus_eval):
+        self.env = hydra.utils.instantiate(cfg.env.env_class, cfg)
+        self.agent = hydra.utils.instantiate(cfg.algo.agent_class, cfg, None, None, "Evaluator")
         self.total_step = 0  # the total training step
         self.start_time = time.time()  # `used_time = time.time() - self.start_time`
-        self.eval_times = args.evaluate_times  # number of times that get episodic cumulative return
-        self.break_step = args.algo.max_train_steps
+        self.eval_times = cfg.algo.evaluate_times  # number of times that get episodic cumulative return
+        self.break_step = cfg.algo.max_train_steps
 
-        self.args = args
+        self.cfg = cfg
         self.num_cpus_eval = num_cpus_eval
 
         self.recorder = []  # total_step, r_avg, r_std, obj_c, ...
@@ -91,7 +91,7 @@ class EvaluatorProc(object):
 
     def get_rewards_and_step(self) -> Tensor:
         rewards_steps_list = list()
-        evaluate_run_ref = [evaluate.remote(self.env, self.agent.actor, self.args) for i in range(self.num_cpus_eval)]
+        evaluate_run_ref = [evaluate.remote(self.env, self.agent.actor, self.cfg) for i in range(self.num_cpus_eval)]
         for _ in range(self.eval_times):
             while len(evaluate_run_ref) > 0:
                 evaluate_ret_ref, evaluate_run_ref = ray.wait(evaluate_run_ref, num_returns=1, timeout=0.1)
@@ -105,7 +105,7 @@ class EvaluatorProc(object):
 """util"""
 # @ray.remote(num_cpus=1, num_gpus=0.001, resources={"node_-1": 0.001})
 @ray.remote(num_cpus=1, num_gpus=0.001)
-def evaluate(env, actor, args):  #
+def evaluate(env, actor, cfg):  #
     start_time = time.time()
     episode_reward = 0
     device = next(actor.parameters()).device
@@ -113,11 +113,11 @@ def evaluate(env, actor, args):  #
     p_num = env.num_defender
 
     # The hidden_state is initialized
-    hidden_state = torch.zeros(size=(args.algo.num_layers, p_num, args.algo.rnn_hidden_dim), dtype=torch.float32, device=device)
+    hidden_state = torch.zeros(size=(cfg.algo.num_layers, p_num, cfg.algo.rnn_hidden_dim), dtype=torch.float32, device=device)
     # The historical embedding is initialized
-    history_embedding = [torch.zeros(size=(p_num, args.algo.embedding_dim), dtype=torch.float32, device=device) for _ in range(args.algo.depth)]
-    actor_embedding_dataset = EmbeddingDataset(attribute=history_embedding, adjacent=None, depth=args.algo.depth)
-    actor_current_embedding = torch.zeros(size=(p_num, args.algo.embedding_dim), dtype=torch.float32, device=device)
+    history_embedding = [torch.zeros(size=(p_num, cfg.algo.embedding_dim), dtype=torch.float32, device=device) for _ in range(cfg.algo.depth)]
+    actor_embedding_dataset = EmbeddingDataset(attribute=history_embedding, adjacent=None, depth=cfg.algo.depth)
+    actor_current_embedding = torch.zeros(size=(p_num, cfg.algo.embedding_dim), dtype=torch.float32, device=device)
     
     o_state = env.boundary_map.obstacle_agent
     o_ten = torch.as_tensor(o_state, dtype=torch.float32).to(device)
@@ -140,9 +140,9 @@ def evaluate(env, actor, args):  #
         p_adj = env.communicate()  # shape of (p_num, p_num)
         o_adj, e_adj = env.sensor()  # shape of (p_num, o_num), (p_num, e_num)
         # evader_step
-        time_1 = time.time()
+        # time_1 = time.time()
         path, pred_map = env.attacker_step()
-        print('cost_time: ', time.time() - time_1)
+        # print('cost_time: ', time.time() - time_1)
         # make the dataset
         p_ten = torch.as_tensor(p_state, dtype=torch.float32).to(device)
         e_ten = torch.as_tensor(e_state, dtype=torch.float32).to(device)
@@ -171,7 +171,7 @@ def evaluate(env, actor, args):  #
         # epi_extended_obstacles.append(pred_map.ex_moving_obstacles + pred_map.ex_obstacles)
         if done:
             # print('DONE!')
-            print('time cost: ', time.time() - start_time)
+            # print('time cost: ', time.time() - start_time)
             # print(f'reward: {episode_reward}')
 
             # epi_obs_p = np.array(epi_obs_p)
@@ -179,13 +179,13 @@ def evaluate(env, actor, args):  #
             # # Plotting
             # sim_moving(
             #     step=env.time_step,
-            #     height=args.map.map_size[0],
-            #     width=args.map.map_size[1],
+            #     height=cfg.map.map_size[0],
+            #     width=cfg.map.map_size[1],
             #     obstacles=env.occupied_map.obstacles,
             #     boundary_obstacles=env.boundary_map.obstacles,
             #     extended_obstacles=epi_extended_obstacles,
-            #     box_width=args.map.resolution,
-            #     n_p=args.env.num_defender,
+            #     box_width=cfg.map.resolution,
+            #     n_p=cfg.env.num_defender,
             #     n_e=1,
             #     p_x=epi_obs_p[:, :, 0],
             #     p_y=epi_obs_p[:, :, 1],
@@ -193,8 +193,8 @@ def evaluate(env, actor, args):  #
             #     e_y=epi_obs_e[:, :, 1],
             #     path=epi_path,
             #     target=epi_target,
-            #     e_ser=args.attacker.sen_range,
-            #     c_r=args.defender.collision_radius,
+            #     e_ser=cfg.attacker.sen_range,
+            #     c_r=cfg.defender.collision_radius,
             #     p_p_adj=epi_p_p_adj,
             #     p_e_adj=epi_p_e_adj,
             #     p_o_adj=epi_p_o_adj,
@@ -213,8 +213,8 @@ def draw_learning_curve(recorder: np.ndarray = None,
     r_avg = recorder[:, 1]
     r_std = recorder[:, 2]
     r_exp = recorder[:, 3]
-    obj_c = recorder[:, 6]
-    obj_a = recorder[:, 7]
+    obj_c = recorder[:, 4]
+    obj_a = recorder[:, 5]
 
     '''plot subplots'''
     import matplotlib as mpl

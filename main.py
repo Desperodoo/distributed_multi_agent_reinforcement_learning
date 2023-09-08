@@ -37,15 +37,15 @@ os.environ["MKL_NUM_THREADS"] = "1"
 
 @hydra.main(config_path='./', config_name='config', version_base=None)
 def train_agent_multiprocessing(cfg):
+    os.environ['NumbaWarning'] = '0'
     nodes_idx = [0]
     num_nodes = len(nodes_idx)
     num_cpus = [128, 80, 112, 72, 32]
     # num_workers = [num_cpus[node] - 2 for node in nodes_idx]
-    num_workers = [1 for _ in nodes_idx]
+    num_workers = [2 for _ in nodes_idx]
     
-    mini_batch_size = [round(num_workers[node] * cfg.algo.sample_epi_num / 2) for node in range(num_nodes)]
+    mini_batch_size = [round(num_workers[node] * cfg.algo.sample_epi_num) for node in range(num_nodes)]
     batch_size = [num_workers[node] * cfg.algo.sample_epi_num for node in range(num_nodes)]
-    
     num_cpus_eval = 1
     
     cwd = cfg.algo.save_cwd
@@ -78,7 +78,7 @@ def train_agent_multiprocessing(cfg):
     while if_Train:
         front_time = time.time()
         # Learner send actor_weights to Workers and Workers sample                
-        worker_run_ref = [[] for _ in range(num_workers)]
+        worker_run_ref = [[] for _ in range(len(num_workers))]
         for node in range(num_nodes):            
             for worker in workers[node]:
                 worker_run_ref[node].append(worker.run.remote(actor_weights, critic_weights))

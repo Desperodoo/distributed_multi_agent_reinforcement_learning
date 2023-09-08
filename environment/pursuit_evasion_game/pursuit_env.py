@@ -53,8 +53,8 @@ def get_raser_map(boundary_map: OccupiedGridMap, num_beams: int32, radius: int32
 
 
 class Pursuit_Env(BaseEnv):
-    def __init__(self, conf):
-        super().__init__(conf.map, conf.env, conf.defender, conf.attacker, conf.sensor)
+    def __init__(self, cfg):
+        super().__init__(cfg.map, cfg.env, cfg.defender, cfg.attacker, cfg.sensor)
 
     def reset(self):
         self.time_step = 0
@@ -63,10 +63,10 @@ class Pursuit_Env(BaseEnv):
         
         inflated_map = self.init_map()
         self.boundary_map = get_boundary_map(self.occupied_map)
-        start_time = time.time()
-        os.environ['NUMBA_WARNINGS'] = '0'
+        # start_time = time.time()
+        os.environ['NumbaWarning'] = '0'
         self.raser_map = get_raser_map(boundary_map=self.boundary_map, num_beams=self.sensor_config.num_beams, radius=self.sensor_config.radius)
-        print('time cost 1:', time.time() - start_time)
+        # print('time cost 1:', time.time() - start_time)
         self.inflated_map = deepcopy(inflated_map)
         # No need for navigation and coverage
         self.init_target(inflated_map=inflated_map)
