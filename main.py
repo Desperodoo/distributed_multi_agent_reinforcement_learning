@@ -1,6 +1,7 @@
 import os
 import ray
 import hydra
+import warnings
 from ray.data import read_numpy
 import time
 import random
@@ -9,6 +10,7 @@ import torch
 import numpy as np
 from runner import Learner, Worker
 from evaluator import EvaluatorProc, draw_learning_curve
+import warnings
 
 
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -37,33 +39,32 @@ os.environ["MKL_NUM_THREADS"] = "1"
 
 @hydra.main(config_path='./', config_name='config', version_base=None)
 def train_agent_multiprocessing(cfg):
-    os.environ['NumbaWarning'] = '0'
-    nodes_idx = [0]
+    nodes_idx = [0, 1]
     num_nodes = len(nodes_idx)
     num_cpus = [128, 80, 112, 72, 32]
-    # num_workers = [num_cpus[node] - 2 for node in nodes_idx]
-    num_workers = [2 for _ in nodes_idx]
+    num_workers = [num_cpus[node] - 8 for node in nodes_idx]
+    # num_workers = [50 for _ in nodes_idx]
     
-    mini_batch_size = [round(num_workers[node] * cfg.algo.sample_epi_num) for node in range(num_nodes)]
+    mini_batch_size = [round(num_workers[node] * cfg.algo.sample_epi_num / 10) for node in range(num_nodes)]
     batch_size = [num_workers[node] * cfg.algo.sample_epi_num for node in range(num_nodes)]
-    num_cpus_eval = 1
+    num_cpus_eval = 70
     
     cwd = cfg.algo.save_cwd
     learners = list()
     workers = [[] for _ in range(num_nodes)]
     idx = 0
     for node in range(num_nodes): 
-        # learners.append(Learner.options(resources={f"node_{node}": 0.001}).remote(cfg, batch_size[node], mini_batch_size[node], node))
-        learners.append(Learner.remote(cfg, batch_size[node], mini_batch_size[node], node))
+        learners.append(Learner.options(resources={f"node_{node}": 0.001}).remote(cfg, batch_size[node], mini_batch_size[node], node))
+        # learners.append(Learner.remote(cfg, batch_size[node], mini_batch_size[node], node))
         for _ in range(num_workers[node]):
-            # workers[node].append(Worker.options(resources={f"node_{node}": 0.001}).remote(idx, p_num, cfg))
-            workers[node].append(Worker.remote(idx, cfg))
+            workers[node].append(Worker.options(resources={f"node_{node}": 0.001}).remote(idx, cfg))
+            # workers[node].append(Worker.remote(idx, cfg))
             idx += 1
     print(f'Learners: {len(learners)}')
     print(f'Workers: ', [len(workers[i]) for i in range(num_nodes)])
     
-    # evaluator = EvaluatorProc.options(resources={f"node_{-1}": 0.001}).remote(cfg, num_cpus_eval)
-    evaluator = EvaluatorProc.remote(cfg, num_cpus_eval)
+    evaluator = EvaluatorProc.options(resources={f"node_{-1}": 0.001}).remote(cfg, num_cpus_eval)
+    # evaluator = EvaluatorProc.remote(cfg, num_cpus_eval)
     print(f'Evaluator: {num_cpus_eval}')
     
     if_Train = True

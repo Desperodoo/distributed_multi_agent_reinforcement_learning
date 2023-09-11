@@ -18,18 +18,19 @@ env:
   action_dim: 9
   attacker_class: Evader
   defender_class: Pursuer
-  max_steps: 50
+  max_steps: 150
   num_attacker: 1
   num_defender: 15
   num_target: 1
   step_size: 0.1
+  difficulty: 10
 sensor:
   num_beams: 36
   radius: 8
 map:
-  center: [45, 50]
-  map_size: [100, 90]
-  num_obstacle_block: 8
+  center: [30, 25]
+  map_size: [60, 55]
+  num_obstacle_block: 5
   resolution: 1
   variance: 10
   num_max_obstacle: 176
@@ -59,7 +60,7 @@ algo:
   worker_device: 'cpu'
   evaluator_device: 'cpu'
   # Learner
-  max_train_steps: 200000000
+  max_train_steps: 20000000
   lr: 0.0005
   gamma: 0.99
   lamda: 0.95
@@ -68,7 +69,6 @@ algo:
   entropy_coef: 0.05
   save_cwd: './model'
   # Evaluator
-  evaluate_times: 10
   # Worker
   sample_epi_num: 1
   # Tricks
@@ -77,7 +77,7 @@ algo:
   use_grad_clip: true
   use_lr_decay: true
   use_orthogonal_init: true
-  use_reward_norm: true
+  use_reward_norm: false
   use_spectral_norm: true
   use_value_clip: true
   set_adam_eps: true
@@ -90,5 +90,5 @@ algo:
   semantic_level_aggregator: mean
   vertex_level_aggregator: mean
   fcra_aggregator: mean
-  depth: 3
+  depth: 1
   num_relation: 3

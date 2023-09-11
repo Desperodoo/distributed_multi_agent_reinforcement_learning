@@ -1,5 +1,5 @@
 import time, math
-import os, sys
+import os, sys, hydra
 import warnings
 import random
 import argparse
@@ -12,6 +12,7 @@ from environment.pursuit_evasion_game.base_env import BaseEnv
 from environment.pursuit_evasion_game.gif_plotting import sim_moving
 from environment.pursuit_evasion_game.Occupied_Grid_Map import OccupiedGridMap
 from skimage.segmentation import find_boundaries
+from numba.core.errors import NumbaDeprecationWarning, NumbaWarning
 
 
 def get_boundary_map(occupied_grid_map: OccupiedGridMap) -> OccupiedGridMap:
@@ -63,10 +64,7 @@ class Pursuit_Env(BaseEnv):
         
         inflated_map = self.init_map()
         self.boundary_map = get_boundary_map(self.occupied_map)
-        # start_time = time.time()
-        os.environ['NumbaWarning'] = '0'
         self.raser_map = get_raser_map(boundary_map=self.boundary_map, num_beams=self.sensor_config.num_beams, radius=self.sensor_config.radius)
-        # print('time cost 1:', time.time() - start_time)
         self.inflated_map = deepcopy(inflated_map)
         # No need for navigation and coverage
         self.init_target(inflated_map=inflated_map)
@@ -77,19 +75,31 @@ class Pursuit_Env(BaseEnv):
     def attacker_step(self):
         # Based On A Star Algorithm
         state = self.get_state(agent_type='defender')
+        dynamic_map = deepcopy(self.occupied_map)
+        dynamic_map.extended_moving_obstacles(state)
         path_list = list()
         for attacker in self.attacker_list:
-            path, way_point, pred_map = attacker.replan(moving_obs=state, occupied_map=self.occupied_map)
+            if self.time_step % self.env_config.difficulty == 0:
+                attacker.replan(moving_obs=state, occupied_map=self.occupied_map)
+            if len(attacker.path) >= 2:
+                last_way_point = attacker.path[-1]
+                if np.linalg.norm((attacker.x - last_way_point[0], attacker.y - last_way_point[1])) < self.map_config.resolution:
+                    attacker.path.pop()
+                way_point = attacker.path[-1]  
+                    
+            else:
+                way_point = attacker.path[-1]
             phi = attacker.waypoint2phi(way_point)
             action = [np.cos(phi) * self.attacker_config.vmax, np.sin(phi) * self.attacker_config.vmax]
             [x, y, vx, vy, theta] = attacker.step(action=action)
-            if self.occupied_map.in_bound((x, y)) and self.occupied_map.is_unoccupied((x, y)):
+            
+            if dynamic_map.in_bound((x, y)) and dynamic_map.is_unoccupied((x, y)):
                 attacker.apply_update([x, y, vx, vy, theta])
             if np.linalg.norm((self.target[0][0] - x, self.target[0][1] - y)) <= self.attacker_config.collision_radius:
                 self.init_target(inflated_map=self.inflated_map)
                 attacker.target = self.target[0]
-            path_list.append(path)
-        return path_list, pred_map    
+            path_list.append(deepcopy(attacker.path))
+        return path_list
         
     def step(self, action):
         next_state = list()
@@ -217,75 +227,14 @@ class Pursuit_Env(BaseEnv):
             middle_a = [np.linalg.norm((a[0] - action[0], a[1] - action[1])) for a in actions_mat]
             action_list.append(middle_a.index(min(middle_a)))
         return action_list
-    
 
-if __name__ == '__main__':
-    os.chdir(sys.path[0])
-    # Env Config
-    parser = argparse.ArgumentParser("Configuration Setting of the MRS Environment")
-    parser.add_argument("--env_name", type=str, default='Pursuit-Evasion Game')
-    parser.add_argument("--max_steps", type=int, default=250, help='The maximum time steps in a episode')
-    parser.add_argument("--step_size", type=float, default=0.1, help='The size of simulation time step')
-    parser.add_argument("--num_target", type=int, default=1, help='The number of target point, 1 in pursuit, n in coverage, 0 in navigation')
-    parser.add_argument("--num_defender", type=int, default=15, help='The number of defender (pursuer/server/navigator)')
-    parser.add_argument("--num_attacker", type=int, default=1, help='The number of attacker (evader/client/target)')
 
-    parser.add_argument("--defender_class", type=str, default='Pursuer', help='The class of the defender')
-    parser.add_argument("--attacker_class", type=str, default='Evader', help='The class of the attacker')
-
-    env_config = parser.parse_args()
-    
-    # Map Config
-    parser = argparse.ArgumentParser("Configuration Setting of the Map")
-    parser.add_argument("--resolution", type=int, default=1, help='The resolution of the map')
-    parser.add_argument("--num_obstacle_block", type=int, default=5, help='The number of the obstacles')
-    parser.add_argument("--center", type=int, default=(30, 30), help='The center of the obstacles')
-    parser.add_argument("--variance", type=int, default=10, help='The varience of normal distribution that generate the position of obstacle block')
-    parser.add_argument("--map_size", type=tuple, default=(60, 60), help='The size of the map')
-    parser.add_argument("--is3D", type=bool, default=False, help='The dimension of freedom, 2 or 3')
-    parser.add_argument("--max_num_obstacle", type=int, default=110, help='The max number of boundary obstacle, equivalent to num_obs_block * 22 (boundary of a 6x7 rectangle)')
-
-    map_config = parser.parse_args()
-    
-    # Pursuer Config
-    parser = argparse.ArgumentParser("Configuration Setting of the Defender")
-    parser.add_argument("--sen_range", type=int, default=8, help='The sensor range of the agents')
-    parser.add_argument("--comm_range", type=int, default=16, help='The communication range of the agents')
-    parser.add_argument("--collision_radius", type=float, default=0.5, help='The smallest distance at which a collision can occur between two agents')
-    parser.add_argument("--step_size", type=float, default=0.1, help='The size of simulation time step')
-
-    parser.add_argument("--vmax", type=float, default=2, help='The limitation of the velocity of the defender')
-    parser.add_argument("--tau", type=float, default=0.2, help='The time constant of first-order dynamic system')
-    parser.add_argument("--DOF", type=int, default=2, help='The dimension of freedom, 2 or 3')
-
-    defender_config = parser.parse_args()
-    
-    # Evader Config
-    parser = argparse.ArgumentParser("Configuration Setting of the Attacker")
-    parser.add_argument("--sen_range", type=int, default=8, help='The sensor range of the agents')
-    parser.add_argument("--comm_range", type=int, default=16, help='The communication range of the agents')
-    parser.add_argument("--collision_radius", type=float, default=0.5, help='The smallest distance at which a collision can occur between two agents')
-    parser.add_argument("--step_size", type=float, default=0.1, help='The size of simulation time step')
-
-    parser.add_argument("--vmax", type=float, default=4, help='The limitation of the velocity of the defender')
-    parser.add_argument("--tau", type=float, default=0.2, help='The time constant of first-order dynamic system')
-    parser.add_argument("--DOF", type=int, default=2, help='The dimension of freedom, 2 or 3')
-
-    parser.add_argument("--x_dim", type=int, default=map_config.map_size[0], help='The x-dimension of map')
-    parser.add_argument("--y_dim", type=int, default=map_config.map_size[1], help='The y-dimension of map')
-    
-    parser.add_argument("--extend_dis", type=int, default=3, help='The extend distance for astar')
-    attacker_config = parser.parse_args()
-    
-    # Sensor Config
-    parser = argparse.ArgumentParser("Configuration Setting of the Sensor")
-    parser.add_argument("--num_beams", type=int, default=36, help='The number of beams in LiDAR')
-    parser.add_argument("--radius", type=int, default=defender_config.sen_range, help='The radius of beams in LiDAR')
-
-    sensor_config = parser.parse_args()
-    
+@hydra.main(config_path='./', config_name='config.yaml', version_base=None)
+def main(cfg):
+    warnings.simplefilter('ignore', category=NumbaDeprecationWarning)
+    warnings.simplefilter('ignore', category=NumbaWarning)        
     # Initialize the Env
-    env = Pursuit_Env(map_config=map_config, env_config=env_config, defender_config=defender_config, attacker_config=attacker_config, sensor_config=sensor_config)
+    env = Pursuit_Env(cfg)
     env.reset()
     done = False
     acc_reward = 0
@@ -310,7 +259,7 @@ if __name__ == '__main__':
         p_o_adj, p_e_adj = env.sensor()
         # action = [random.choice([0, 1, 2, 3, 4, 5, 6, 7, 8]) for _ in range(env_config.num_defender)]
         action = env.demon()
-        path, pred_map = env.attacker_step()
+        path = env.attacker_step()
         rewards, done, info = env.step(action)
         acc_reward += sum(rewards)
         # Store Evaluate Matrix
@@ -322,7 +271,7 @@ if __name__ == '__main__':
         epi_p_p_adj.append(p_p_adj)
         epi_p_e_adj.append(p_e_adj)
         epi_p_o_adj.append(p_o_adj)
-        epi_extended_obstacles.append(pred_map.ex_moving_obstacles + pred_map.ex_obstacles)
+        # epi_extended_obstacles.append(pred_map.ex_moving_obstacles + pred_map.ex_obstacles)
         if done:
             # Print Game Result
             print('DONE!')
@@ -334,13 +283,13 @@ if __name__ == '__main__':
             # Plotting
             sim_moving(
                 step=env.time_step,
-                height=map_config.map_size[0],
-                width=map_config.map_size[1],
+                height=cfg.map.map_size[0],
+                width=cfg.map.map_size[1],
                 obstacles=env.occupied_map.obstacles,
                 boundary_obstacles=env.boundary_map.obstacles,
-                extended_obstacles=epi_extended_obstacles,
-                box_width=map_config.resolution,
-                n_p=env_config.num_defender,
+                # extended_obstacles=epi_extended_obstacles,
+                box_width=cfg.map.resolution,
+                n_p=cfg.env.num_defender,
                 n_e=1,
                 p_x=epi_obs_p[:, :, 0],
                 p_y=epi_obs_p[:, :, 1],
@@ -348,11 +297,15 @@ if __name__ == '__main__':
                 e_y=epi_obs_e[:, :, 1],
                 path=epi_path,
                 target=epi_target,
-                e_ser=attacker_config.sen_range,
-                c_r=defender_config.collision_radius,
+                e_ser=cfg.attacker.sen_range,
+                c_r=cfg.defender.collision_radius,
                 p_p_adj=epi_p_p_adj,
                 p_e_adj=epi_p_e_adj,
                 p_o_adj=epi_p_o_adj,
                 dir='sim_moving' + str(time.time())
             )
             break
+
+
+if __name__ == '__main__':
+    main()

@@ -40,13 +40,13 @@ def draw_circle(x, y, r, color, line_style, line_width):
 
 
 def draw_waypoint(x, y):
-    path = Path(vertices=np.array([[x - 0.25, y], [x, y - 0.25], [x + 0.25, y], [x, y + 0.25]]))
-    waypoint = patches.PathPatch(path, color='red')
+    path = Path(vertices=np.array([[x - 0.15, y], [x, y - 0.15], [x + 0.25, y], [x, y + 0.25]]))
+    waypoint = patches.PathPatch(path, color='red', alpha=0.5)
     return waypoint
 
 
 # 绘制动态图
-def sim_moving(step, width, height, obstacles, boundary_obstacles, extended_obstacles, box_width, n_p, n_e, p_x, p_y, e_x, e_y, path,
+def sim_moving(step, width, height, obstacles, boundary_obstacles, box_width, n_p, n_e, p_x, p_y, e_x, e_y, path,
                target, e_ser, c_r, p_p_adj, p_e_adj, p_o_adj, dir):
     """
 
@@ -163,17 +163,17 @@ def sim_moving(step, width, height, obstacles, boundary_obstacles, extended_obst
                 ax3.add_patch(wp)
 
         # draw communication
-        # for j, connected in enumerate(p_p_adj[i]):
-        #     if connected:
-        #         ax3.plot([p_x[i, 0], p_x[i, j]], [p_y[i, 0], p_y[i, j]], color='green', linestyle='--', alpha=0.5)
+        for j, connected in enumerate(p_p_adj[i]):
+            if connected:
+                ax3.plot([p_x[i, 0], p_x[i, j]], [p_y[i, 0], p_y[i, j]], color='green', linestyle='--', alpha=0.5)
 
-        # for j, connected in enumerate(p_e_adj[i]):
-        #     if connected:
-        #         ax3.plot([p_x[i, 0], e_x[i, j]], [p_y[i, 0], e_y[i, j]], color='red', linestyle='--', alpha=0.5)
+        for j, connected in enumerate(p_e_adj[i]):
+            if connected:
+                ax3.plot([p_x[i, 0], e_x[i, j]], [p_y[i, 0], e_y[i, j]], color='red', linestyle='--', alpha=0.5)
 
-        # for j, connected in enumerate(p_o_adj[i]):
-        #     if connected:
-        #         ax3.plot([p_x[i, 0], boundary_obstacles[j][0]], [p_y[i, 0], boundary_obstacles[j][1]], color='white', linestyle='--', alpha=0.5)
+        for j, connected in enumerate(p_o_adj[i]):
+            if connected:
+                ax3.plot([p_x[i, 0], boundary_obstacles[j][0]], [p_y[i, 0], boundary_obstacles[j][1]], color='black', linestyle='--', alpha=0.5)
 
         fig3.savefig(dir + '.png')
         image_list.append(imageio.imread(dir + '.png'))

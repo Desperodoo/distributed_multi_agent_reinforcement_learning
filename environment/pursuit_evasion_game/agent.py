@@ -192,6 +192,7 @@ class Evader(Agent):
         self.target = target
         self.astar = AStar_2D(width=map_config.map_size[0], height=map_config.map_size[1])
         self.extend_dis = attacker_config.extend_dis
+        self.path = None
         
     def step(self, action):
         # a belong to [-phi, phi]
@@ -252,13 +253,10 @@ class Evader(Agent):
                 break
             
             extend_dis -= 1
-
-        if len(path) >= 2:
-            next_way_point = path[-2]
-        else:
-            next_way_point = path[0]
-
-        return path, next_way_point, pred_map
+        
+        self.path = path
+        
+        return pred_map
 
     def waypoint2phi(self, way_point):
         """

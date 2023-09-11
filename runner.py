@@ -8,6 +8,7 @@ import torch
 import numpy as np
 from DHGN.replay_buffer import BigBuffer
 from DHGN.mappo_parallel import MAPPO
+from numba.core.errors import NumbaDeprecationWarning, NumbaWarning
 
 
 @ray.remote(num_cpus=1, num_gpus=0.001)
@@ -80,14 +81,13 @@ class Learner(object):
 @ray.remote(num_cpus=1, num_gpus=0.001)
 class Worker(object):
     def __init__(self, worker_id: int, cfg):
-        self.worker_id = worker_id
         self.env = hydra.utils.instantiate(cfg.env.env_class, cfg)
         self.agent = hydra.utils.instantiate(cfg.algo.agent_class, cfg, None, None, "Worker")
         self.sample_epi_num = cfg.algo.sample_epi_num
 
     def run(self, actor_weights, critic_weights):
-        warnings.filterwarnings("ignore", message="Values in x were outside bounds during a minimize step, clipping to bounds")
-        worker_id = self.worker_id
+        warnings.simplefilter('ignore', category=NumbaDeprecationWarning)
+        warnings.simplefilter('ignore', category=NumbaWarning)        
         torch.set_grad_enabled(False)
         '''init agent'''
         self.agent.actor.set_weights(actor_weights)

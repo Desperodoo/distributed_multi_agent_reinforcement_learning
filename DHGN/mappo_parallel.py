@@ -59,12 +59,13 @@ class AttributeDataset(Dataset):
     
     def __getitem__(self, idx):
         a1 = self.attribute[0]
-        a2 = self.attribute[idx]
+        a2 = self.attribute[1]
+        a3 = self.attribute[2]
         if self.is_critic:
             adj = torch.ones_like(input=self.adjacent[idx], dtype=self.adjacent[idx].dtype, device=self.adjacent[idx].device)
         else:
             adj = self.adjacent[idx]
-        return a1, a2, idx, adj
+        return a1, a2, a3, idx, adj
     
 
 class EmbeddingDataset(Dataset):
@@ -105,7 +106,10 @@ class EmbeddingDataset2(Dataset):
     def __getitem__(self, index):
         idx = self.depth - (index + 1)
         a1 = self.attribute[:, idx:idx + self.num_episode, :, :]
-        adj = self.adjacent
+        if self.is_critic:
+            adj = torch.ones_like(input=self.adjacent, dtype=self.adjacent.dtype, device=self.adjacent.device)
+        else:
+            adj = self.adjacent
         return a1, index, adj
         
 
@@ -122,9 +126,15 @@ class DHGN(nn.Module):
         self.fcra_agg = algo_config.fcra_aggregator
         self.algo_config = algo_config
         self.device = device
+        
+        self.semantic_layer = preproc_layer(3 * embedding_dim + input_dim, embedding_dim) if is_sn else nn.Linear(3 * embedding_dim + input_dim, embedding_dim)
+        
         # feature: (*, num_agent, num_agent, input_size -> embedding_size)
         for r in range(algo_config.num_relation):
-            layer = preproc_layer(input_dim, embedding_dim) if is_sn else nn.Linear(input_dim, embedding_dim)
+            if r == 0:
+                layer = preproc_layer(2 * input_dim, embedding_dim) if is_sn else nn.Linear(2 * input_dim, embedding_dim)
+            else:
+                layer = preproc_layer(input_dim, embedding_dim) if is_sn else nn.Linear(input_dim, embedding_dim)
             self.MSG_layers.append(layer)
 
         for k in range(algo_config.depth):
@@ -135,9 +145,11 @@ class DHGN(nn.Module):
         # adjacent matrix: (*, num_agent, 1, num_agent)
         # alpha: (*, )
         if self.v_agg == 'mean':
-            for r in range(algo_config.num_relation):
-                layer = preproc_layer(embedding_dim, embedding_dim) if is_sn else nn.Linear(embedding_dim, embedding_dim)
-                self.AGG_layers[f'AGG_vertex_{r}'] = layer
+            # for r in range(algo_config.num_relation):
+            #     layer = preproc_layer(embedding_dim, embedding_dim) if is_sn else nn.Linear(embedding_dim, embedding_dim)
+            #     self.AGG_layers[f'AGG_vertex_{r}'] = layer
+            layer = preproc_layer(embedding_dim, embedding_dim) if is_sn else nn.Linear(embedding_dim, embedding_dim)
+            self.AGG_layers[f'AGG_vertex_{0}'] = layer
             self.vertex_aggregate = self.mean_operator
         elif self.v_agg == 'pool':
             for r in range(algo_config.num_relation):
@@ -154,20 +166,20 @@ class DHGN(nn.Module):
             self.LeakyReLU = nn.LeakyReLU()
             self.vertex_aggregate = self.att_operator
             
-        if self.s_agg == 'mean':
-            layer = preproc_layer(embedding_dim, embedding_dim) if is_sn else nn.Linear(embedding_dim, embedding_dim)
-            self.AGG_layers['AGG_semantic'] = layer
-            self.semantic_aggregate = self.mean_operator
-        elif self.s_agg == 'pool':
-            layer = preproc_layer(embedding_dim, embedding_dim) if is_sn else nn.Linear(embedding_dim, embedding_dim)
-            self.AGG_layers['AGG_semantic'] = layer
-            self.semantic_aggregate = self.pool_operator
-        elif self.s_agg == 'att':
-            layer = preproc_layer(embedding_dim, embedding_dim) if is_sn else nn.Linear(embedding_dim, embedding_dim)
-            self.AGG_layers['AGG_semantic'] = layer
-            alpha = Parameter(torch.zeros(size=(embedding_dim, 1)), required_grad=True)
-            self.alpha['AGG_semantic'] = alpha
-            self.semantic_aggregate = self.att_operator
+        # if self.s_agg == 'mean':
+        #     layer = preproc_layer(embedding_dim, embedding_dim) if is_sn else nn.Linear(embedding_dim, embedding_dim)
+        #     self.AGG_layers['AGG_semantic'] = layer
+        #     self.semantic_aggregate = self.mean_operator
+        # elif self.s_agg == 'pool':
+        #     layer = preproc_layer(embedding_dim, embedding_dim) if is_sn else nn.Linear(embedding_dim, embedding_dim)
+        #     self.AGG_layers['AGG_semantic'] = layer
+        #     self.semantic_aggregate = self.pool_operator
+        # elif self.s_agg == 'att':
+        #     layer = preproc_layer(embedding_dim, embedding_dim) if is_sn else nn.Linear(embedding_dim, embedding_dim)
+        #     self.AGG_layers['AGG_semantic'] = layer
+        #     alpha = Parameter(torch.zeros(size=(embedding_dim, 1)), required_grad=True)
+        #     self.alpha['AGG_semantic'] = alpha
+        #     self.semantic_aggregate = self.att_operator
                 
         if self.fcra_agg == 'mean':
             for k in range(algo_config.depth):
@@ -241,10 +253,21 @@ class DHGN(nn.Module):
                 shape = (*, num_agnet, feature_dim)
         """
         embeddings_list = list()
-        for (a1, a2, idx, adjacent_mat) in data_loader:
+        for (a1, a2, a3, idx, adjacent_mat) in data_loader:
             r = idx[0]
             # message
-            a = self.coordinate(a1, a2)
+            if r == 0:
+                t_1 = self.coordinate(a1, a1)
+                t_2 = self.coordinate(a1, a2)
+                expand_size = [-1] * len(t_2.size())
+                expand_size[-2] = t_2.size()[-3]
+                t_2 = t_2.expand(*expand_size)
+                a = torch.concatenate((t_1, t_2), dim=-1)
+            elif r == 1:
+                a = self.coordinate(a1, a2)
+            else:
+                a = self.coordinate(a1, a3)
+
             message = self.message(layer=self.MSG_layers[r], attributes=a)
             # aggregate
             if self.v_agg == 'att':
@@ -252,26 +275,32 @@ class DHGN(nn.Module):
                 embeddings = self.vertex_aggregate(layer=self.AGG_layers[f'AGG_vertex_{r}'], alpha=self.alpha[f'AGG_vertex_{r}'], message=message, adjacent_mat=adjacent_mat)
             elif self.v_agg == 'mean':
                 adjacent_mat = adjacent_mat.unsqueeze(-2)
-                embeddings = self.vertex_aggregate(layer=self.AGG_layers[f'AGG_vertex_{r}'], message=message, adjacent_mat=adjacent_mat)
+                embeddings = self.vertex_aggregate(layer=self.AGG_layers[f'AGG_vertex_{0}'], message=message, adjacent_mat=adjacent_mat)
             elif self.v_agg == 'pool':
                 embeddings = self.vertex_aggregate(layer=self.AGG_layers[f'AGG_vertex_{r}'], message=message, adjacent_mat=adjacent_mat)
             embeddings_list.append(embeddings)
-        vertex_level_embeddings = torch.concatenate(embeddings_list, dim=-2)
+            
+        # vertex_level_embeddings = torch.concatenate(embeddings_list, dim=-2)
+        vertex_level_embeddings = torch.concatenate(embeddings_list, dim=-1)
+        a1 = a1.unsqueeze(-2)
+        vertex_level_embeddings = torch.concatenate([a1, vertex_level_embeddings], axis=-1)    
         """
             vertex_level_embeddings: (*, num_agent, num_relation, feature_dim)
+            vertex_level_embeddings: (*, num_agent, num_relation * feature_dim)
             adjacent_mat: (*, num_agent, num_relation)
         Returns:
             semantic_level_embeddings: (*, num_agent, 1, feature_dim)
         """
-        adjacent_mat = torch.ones(size=vertex_level_embeddings.size()[:-1], device=self.device, requires_grad=False)
-        if self.s_agg == 'att':
-            adjacent_mat = adjacent_mat.unsqueeze(-2)
-            semantic_level_embeddings = self.semantic_aggregate(layer=self.AGG_layers['AGG_semantic'], alpha=self.alpha['AGG_semantic'], message=vertex_level_embeddings, adjacent_mat=None)
-        elif self.s_agg == 'mean':
-            adjacent_mat = adjacent_mat.unsqueeze(-2)
-            semantic_level_embeddings = self.semantic_aggregate(layer=self.AGG_layers['AGG_semantic'], message=vertex_level_embeddings, adjacent_mat=adjacent_mat)
-        elif self.s_agg == 'pool':
-            semantic_level_embeddings = self.semantic_aggregate(layer=self.AGG_layers['AGG_semantic'], message=vertex_level_embeddings, adjacent_mat=adjacent_mat)
+        # adjacent_mat = torch.ones(size=vertex_level_embeddings.size()[:-1], device=self.device, requires_grad=False)
+        # if self.s_agg == 'att':
+        #     adjacent_mat = adjacent_mat.unsqueeze(-2)
+        #     semantic_level_embeddings = self.semantic_aggregate(layer=self.AGG_layers['AGG_semantic'], alpha=self.alpha['AGG_semantic'], message=vertex_level_embeddings, adjacent_mat=None)
+        # elif self.s_agg == 'mean':
+        #     adjacent_mat = adjacent_mat.unsqueeze(-2)
+        #     semantic_level_embeddings = self.semantic_aggregate(layer=self.AGG_layers['AGG_semantic'], message=vertex_level_embeddings, adjacent_mat=adjacent_mat)
+        # elif self.s_agg == 'pool':
+        #     semantic_level_embeddings = self.semantic_aggregate(layer=self.AGG_layers['AGG_semantic'], message=vertex_level_embeddings, adjacent_mat=adjacent_mat)
+        semantic_level_embeddings = self.semantic_layer(vertex_level_embeddings)
         return semantic_level_embeddings
 
     def forward(self, attributes: DataLoader, historical_embeddings: DataLoader) -> torch.Tensor:
@@ -558,6 +587,14 @@ class MAPPO:
             device=self.device
         )
         
+        # critic_encoder = DHGN(
+        #     input_dim=self.input_dim,
+        #     embedding_dim=self.embedding_dim,
+        #     is_sn=self.sn,
+        #     algo_config=cfg.algo,
+        #     device=self.device
+        # )
+        
         self.depth = cfg.algo.depth
         
         self.actor = SharedActor(
@@ -595,6 +632,7 @@ class MAPPO:
         self.ac_optimizer = torch.optim.Adam(self.ac_parameters, lr=self.lr, eps=1e-5)
         
         self.minibuffer = None
+        self.total_step = 0
         self.cfg = cfg
 
     def train(self, replay_buffer, total_steps):
@@ -635,10 +673,10 @@ class MAPPO:
                 dtype=torch.float32,
                 device=self.device
             )
-            actor_attribute_dataset = AttributeDataset(attribute=[batch['p_state'][index], batch['e_state'][index], batch['o_state'][index]], adjacent=[batch['p_adj'][index], batch['e_adj'][index], batch['o_adj'][index]], is_critic=True)
+            actor_attribute_dataset = AttributeDataset(attribute=[batch['p_state'][index], batch['e_state'][index], batch['o_state'][index]], adjacent=[batch['p_adj'][index], batch['e_adj'][index], batch['o_adj'][index]], is_critic=False)
             critic_attribute_dataset = AttributeDataset(attribute=[batch['p_state'][index], batch['e_state'][index], batch['o_state'][index]], adjacent=[batch['p_adj'][index], batch['e_adj'][index], batch['o_adj'][index]], is_critic=True)
-            actor_embedding_dataset = EmbeddingDataset2(attribute=batch['actor_historical_embedding'], adjacent=batch['p_adj'], is_critic=False, depth=self.cfg.algo.depth)
-            critic_embedding_dataset = EmbeddingDataset2(attribute=batch['critic_historical_embedding'], adjacent=batch['p_adj'], is_critic=True, depth=self.cfg.algo.depth)
+            actor_embedding_dataset = EmbeddingDataset2(attribute=batch['actor_historical_embedding'][index], adjacent=batch['p_adj'][index], is_critic=False, depth=self.cfg.algo.depth)
+            critic_embedding_dataset = EmbeddingDataset2(attribute=batch['critic_historical_embedding'][index], adjacent=batch['p_adj'][index], is_critic=True, depth=self.cfg.algo.depth)
 
             actor_attribute_dataloader = DataLoader(dataset=actor_attribute_dataset, batch_size=1, shuffle=False)
             critic_attribute_dataloader = DataLoader(dataset=critic_attribute_dataset, batch_size=1, shuffle=False)
@@ -670,7 +708,7 @@ class MAPPO:
             ac_loss = actor_loss + critic_loss
             ac_loss.backward()
             if self.use_grad_clip:  # Trick 7: Gradient clip
-                torch.nn.utils.clip_grad_norm_(self.ac_parameters, 10.0)
+                torch.nn.utils.clip_grad_norm_(self.ac_parameters, 5.0)
             
             object_critics += critic_loss.item()
             object_actors += actor_loss.item()
@@ -688,7 +726,8 @@ class MAPPO:
         lr_now = self.lr * (1 - total_steps / self.max_train_steps)
         for p in self.ac_optimizer.param_groups:
             p['lr'] = lr_now
-    
+        self.total_step = total_steps
+
     def explore_env(self, env, num_episode):
         exp_reward = 0.0
         sample_steps = 0
@@ -723,7 +762,7 @@ class MAPPO:
             p_adj = env.communicate()  # shape of (p_num, p_num)
             o_adj, e_adj = env.sensor()  # shape of (p_num, o_num), (p_num, e_num)
             # evader_step
-            _, __ = env.attacker_step()
+            _ = env.attacker_step()
             # make the dataset
             p_ten = torch.as_tensor(p_state, dtype=torch.float32).to(self.device)
             e_ten = torch.as_tensor(e_state, dtype=torch.float32).to(self.device)
@@ -746,7 +785,12 @@ class MAPPO:
             actor_current_embedding = actor_current_embedding.squeeze(0)
             critic_current_embedding = critic_current_embedding.squeeze(0)
             # Take a step    
-            r, done, info = env.step(a_n.detach().cpu().numpy())  # Take a step
+            actions = a_n.detach().cpu().numpy()
+            # curricula = self.total_step / self.max_train_steps
+            # if np.random.rand() > curricula:
+            #     action_list = env.demon()
+            #     actions = [round((actions[i] + action_list[i]) / 2) for i in range(len(action_list))]
+            r, done, info = env.step(actions)  # Take a step
             episode_reward += sum(r)
             r = self.reward_norm(r)  # TODO: Dynamic shape
             # Store the transition

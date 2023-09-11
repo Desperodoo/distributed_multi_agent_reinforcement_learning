@@ -2,6 +2,7 @@ import os
 import ray
 import time
 import hydra
+import warnings
 import random
 import argparse
 import torch.nn
@@ -12,6 +13,7 @@ from torch.utils.data import Dataset, DataLoader
 from DHGN.mappo_parallel import DHGN, SharedActor
 from environment.pursuit_evasion_game.pursuit_env import Pursuit_Env
 from environment.pursuit_evasion_game.gif_plotting import sim_moving
+from numba.core.errors import NumbaDeprecationWarning, NumbaWarning
 # from config import env_config, map_config, sensor_config, defender_config, attacker_config, algo_config
 
 
@@ -22,7 +24,6 @@ class EvaluatorProc(object):
         self.agent = hydra.utils.instantiate(cfg.algo.agent_class, cfg, None, None, "Evaluator")
         self.total_step = 0  # the total training step
         self.start_time = time.time()  # `used_time = time.time() - self.start_time`
-        self.eval_times = cfg.algo.evaluate_times  # number of times that get episodic cumulative return
         self.break_step = cfg.algo.max_train_steps
 
         self.cfg = cfg
@@ -92,21 +93,21 @@ class EvaluatorProc(object):
     def get_rewards_and_step(self) -> Tensor:
         rewards_steps_list = list()
         evaluate_run_ref = [evaluate.remote(self.env, self.agent.actor, self.cfg) for i in range(self.num_cpus_eval)]
-        for _ in range(self.eval_times):
-            while len(evaluate_run_ref) > 0:
-                evaluate_ret_ref, evaluate_run_ref = ray.wait(evaluate_run_ref, num_returns=1, timeout=0.1)
-                if len(evaluate_ret_ref) > 0:
-                    rewards_steps = ray.get(evaluate_ret_ref)[0]
-                    rewards_steps_list.append(rewards_steps)
+        while len(evaluate_run_ref) > 0:
+            evaluate_ret_ref, evaluate_run_ref = ray.wait(evaluate_run_ref, num_returns=1, timeout=0.1)
+            if len(evaluate_ret_ref) > 0:
+                rewards_steps = ray.get(evaluate_ret_ref)[0]
+                rewards_steps_list.append(rewards_steps)
         rewards_steps_ten = torch.tensor(rewards_steps_list, dtype=torch.float32)
         return rewards_steps_ten  # rewards_steps_ten.shape[1] == 2
 
 
 """util"""
-# @ray.remote(num_cpus=1, num_gpus=0.001, resources={"node_-1": 0.001})
-@ray.remote(num_cpus=1, num_gpus=0.001)
+@ray.remote(num_cpus=1, num_gpus=0.001, resources={"node_-1": 0.001})
+# @ray.remote(num_cpus=1, num_gpus=0.001)
 def evaluate(env, actor, cfg):  #
-    start_time = time.time()
+    warnings.simplefilter('ignore', category=NumbaDeprecationWarning)
+    warnings.simplefilter('ignore', category=NumbaWarning)        
     episode_reward = 0
     device = next(actor.parameters()).device
     env.reset()
@@ -131,7 +132,6 @@ def evaluate(env, actor, cfg):  #
     # epi_p_o_adj = list()
     # epi_p_e_adj = list()
     # epi_p_p_adj = list()
-    # epi_extended_obstacles = list()
     # idx = 0
     for step in range(env.max_steps):
         p_state = env.get_state(agent_type='defender')  # obs_n.shape=(N,obs_dim)
@@ -141,7 +141,7 @@ def evaluate(env, actor, cfg):  #
         o_adj, e_adj = env.sensor()  # shape of (p_num, o_num), (p_num, e_num)
         # evader_step
         # time_1 = time.time()
-        path, pred_map = env.attacker_step()
+        path = env.attacker_step()
         # print('cost_time: ', time.time() - time_1)
         # make the dataset
         p_ten = torch.as_tensor(p_state, dtype=torch.float32).to(device)
@@ -168,10 +168,8 @@ def evaluate(env, actor, cfg):  #
         # epi_p_p_adj.append(p_adj)
         # epi_p_e_adj.append(e_adj)
         # epi_p_o_adj.append(o_adj)
-        # epi_extended_obstacles.append(pred_map.ex_moving_obstacles + pred_map.ex_obstacles)
         if done:
             # print('DONE!')
-            # print('time cost: ', time.time() - start_time)
             # print(f'reward: {episode_reward}')
 
             # epi_obs_p = np.array(epi_obs_p)
@@ -183,7 +181,6 @@ def evaluate(env, actor, cfg):  #
             #     width=cfg.map.map_size[1],
             #     obstacles=env.occupied_map.obstacles,
             #     boundary_obstacles=env.boundary_map.obstacles,
-            #     extended_obstacles=epi_extended_obstacles,
             #     box_width=cfg.map.resolution,
             #     n_p=cfg.env.num_defender,
             #     n_e=1,
@@ -300,10 +297,16 @@ class AttributeDataset(Dataset):
         return len(self.attribute)
     
     def __getitem__(self, idx):
+        # a1 = self.attribute[0]
+        # a2 = self.attribute[idx]
+        # adj = self.adjacent[idx]
+        # return a1, a2, idx, adj
         a1 = self.attribute[0]
-        a2 = self.attribute[idx]
+        a2 = self.attribute[1]
+        a3 = self.attribute[2]
+
         adj = self.adjacent[idx]
-        return a1, a2, idx, adj
+        return a1, a2, a3, idx, adj
     
 
 @hydra.main(config_path='./', config_name='config.yaml', version_base=None)
@@ -323,6 +326,8 @@ def main(cfg):
         rnn_hidden_dim=cfg.algo.rnn_hidden_dim,
         is_sn=False
     )
+    pretrain_actor = torch.load('./model/actor.pth', map_location='cpu')
+    actor.load_state_dict(pretrain_actor.state_dict())
     
     env = hydra.utils.instantiate(cfg.env.env_class, 
         cfg
